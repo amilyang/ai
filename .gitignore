@@ -1,0 +1,10 @@
+# 创建 .gitignore
+node_modules/
+dist/
+*.log
+.env.local
+.env.*.local
+.DS_Store
+chroma_db/
+*.pyc
+__pycache__/
