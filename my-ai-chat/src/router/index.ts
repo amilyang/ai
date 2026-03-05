@@ -7,7 +7,6 @@
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
 import { createRouter, createWebHistory } from 'vue-router'
-import AiChat from '../AiChat.vue'
 import ChatComponent from '../ChatComponent.vue'
 import uploadFile from '../uploadFile.vue'
 
@@ -17,11 +16,6 @@ const router = createRouter({
     {
       path: '/',
       redirect: '/chat'
-    },
-    {
-      path: '/chat',
-      name: 'chat',
-      component: AiChat
     },
     {
       path: '/chat-stream',
