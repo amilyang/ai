@@ -79,6 +79,9 @@ async def get_db_connection():
     return conn
 
 # --- API 接口 ---
+@app.get("/")
+async def root():
+    return {"message": "Hello World! API is running on Render.", "status": "ok"}
 
 # 1. 创建会话
 @app.post("/api/session")
