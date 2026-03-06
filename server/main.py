@@ -19,6 +19,9 @@ dotenv.load_dotenv()
 API_KEY = os.getenv("DASHSCOPE_API_KEY")
 DB_PATH = "chat.db"
 
+if not API_KEY:
+    raise ValueError("⚠️ 致命错误：未找到 DASHSCOPE_API_KEY 环境变量！")
+
 # --- 数据库初始化 (同步方式即可，因为只在启动时运行) ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -80,6 +83,12 @@ async def get_db_connection():
 # 1. 创建会话
 @app.post("/api/session")
 async def create_session(req: SessionCreate):
+    print("🚀 [DEBUG] 收到创建会话请求")  # 1. 确认请求进来了
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    print(f"🔑 [DEBUG] API Key 存在吗？{bool(api_key)}") # 2. 确认 Key 读到了
+    if not api_key:
+        print("❌ [ERROR] API KEY 缺失！")
+        return {"error": "Server config error"}, 500
     conn = await get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO sessions (title) VALUES (?)", (req.title,))

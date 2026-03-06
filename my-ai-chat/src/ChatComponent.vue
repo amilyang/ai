@@ -5,7 +5,7 @@ import type MarkdownItType from 'markdown-it';
 import MarkdownIt from 'markdown-it';
 import { nextTick, onMounted, ref } from 'vue';
 
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_BASE || '/api';
 
 const md: MarkdownItType = new MarkdownIt({
   html: true,
@@ -33,7 +33,7 @@ const messages = ref<Message[]>([]);
 const isLoading = ref(false);
 const isThinking = ref(false);
 const abortController = ref<AbortController | null>(null);
-const currentSessionId = ref('');
+const currentSessionId = ref(localStorage.getItem('sessionId') || '');
 
 const sendMessage = async () => {
   if (!inputText.value.trim() || isLoading.value) return;
@@ -136,6 +136,12 @@ const sendMessage = async () => {
 };
 
 const createSession = async () => {
+  if (currentSessionId.value) {
+    console.log('已有 sessionId:', currentSessionId.value);
+    await loadHistory();
+    return;
+  }
+
   console.log('createSession');
 
   const response = await fetch(`${API_BASE}/session`, {
@@ -148,6 +154,7 @@ const createSession = async () => {
   }
   const data = await response.json();
   currentSessionId.value = data.sessionId || '';
+  localStorage.setItem('sessionId', currentSessionId.value);
   console.log('sessionId:', currentSessionId.value);
 
   await loadHistory();
