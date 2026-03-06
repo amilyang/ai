@@ -89,6 +89,20 @@ async def create_session(req: SessionCreate):
     if not api_key:
         print("❌ [ERROR] API KEY 缺失！")
         return {"error": "Server config error"}, 500
+    try:
+        # 数据库操作前打印
+        print("💾 [DEBUG] 准备连接数据库...")
+        conn = get_db_connection()
+        print("✅ [DEBUG] 数据库连接成功")
+
+        # ... 业务逻辑 ...
+
+    except Exception as e:
+        # 🔴 关键：捕获所有异常并打印到 Render 日志
+        print(f"💥 [CRITICAL ERROR] 发生异常: {str(e)}")
+        import traceback
+        print(traceback.format_exc()) # 打印完整堆栈
+        return {"detail": str(e)}, 500
     conn = await get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO sessions (title) VALUES (?)", (req.title,))
