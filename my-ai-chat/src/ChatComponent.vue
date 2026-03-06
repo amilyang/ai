@@ -5,6 +5,8 @@ import type MarkdownItType from 'markdown-it';
 import MarkdownIt from 'markdown-it';
 import { nextTick, onMounted, ref } from 'vue';
 
+const API_BASE = '/api';
+
 const md: MarkdownItType = new MarkdownIt({
   html: true,
   linkify: true,
@@ -32,40 +34,43 @@ const isLoading = ref(false);
 const isThinking = ref(false);
 const abortController = ref<AbortController | null>(null);
 const currentSessionId = ref('');
+
 const sendMessage = async () => {
   if (!inputText.value.trim() || isLoading.value) return;
+  if (!currentSessionId.value) {
+    console.error('sessionId is empty!');
+    alert('会话未创建，请刷新页面');
+    return;
+  }
 
-  // 1. 初始化 AbortController (用于停止生成)
   abortController.value = new AbortController();
   const signal = abortController.value.signal;
 
   const userQuery = inputText.value;
   inputText.value = '';
   isLoading.value = true;
-  isThinking.value = true; // 开始思考
+  isThinking.value = true;
 
   messages.value.push({ role: 'user', content: userQuery });
   const aiMessageIndex = messages.value.push({ role: 'assistant', content: '' }) - 1;
   let currentReply = '';
 
   try {
-    // 构造 Payload (同 Day 3)
-    const userQuery = inputText.value;
-
-    const response = await fetch('/api/chat', {
+    const response = await fetch(`${API_BASE}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: signal,
       body: JSON.stringify({
-        sessionId: currentSessionId.value, // 确保这是个数字
+        sessionId: currentSessionId.value,
         message: userQuery
       })
     });
 
     if (!response.ok) {
       if (response.status === 400 && signal.aborted) {
-        // 用户主动停止，不报错
-        if(messages.value[aiMessageIndex])
-        messages.value[aiMessageIndex].content += "\n\n*(已停止生成)*";
+        if (messages.value[aiMessageIndex]) {
+          messages.value[aiMessageIndex].content += '\n\n*(已停止生成)*';
+        }
         return;
       }
       throw new Error(`HTTP error! status: ${response.status}`);
@@ -92,14 +97,18 @@ const sendMessage = async () => {
           if (jsonStr && jsonStr !== '[DONE]') {
             try {
               const data = JSON.parse(jsonStr);
-              const content = data.output?.choices?.[0]?.message?.content || '';
+              const content = data.content || '';
               if (content) {
                 currentReply = content;
-                if(messages.value[aiMessageIndex])
-                messages.value[aiMessageIndex].content = currentReply;
+                if (messages.value[aiMessageIndex]) {
+                  messages.value[aiMessageIndex].content = currentReply;
+                  if (isThinking.value) {
+                    isThinking.value = false;
+                  }
+                }
                 scrollToBottom();
               }
-            } catch { /* ignore parse errors */ }
+            } catch { /* ignore */ }
           } else {
             isThinking.value = false;
             break;
@@ -107,16 +116,17 @@ const sendMessage = async () => {
         }
       }
     }
-
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      if(messages.value[aiMessageIndex])
-      messages.value[aiMessageIndex].content += "\n\n*(用户已停止)*";
+      if (messages.value[aiMessageIndex]) {
+        messages.value[aiMessageIndex].content += '\n\n*(用户已停止)*';
+      }
     } else {
       console.error(error);
       const errorMessage = error instanceof Error ? error.message : String(error);
-      if(messages.value[aiMessageIndex])
-      messages.value[aiMessageIndex].content = `❌ 错误: ${errorMessage}`;
+      if (messages.value[aiMessageIndex]) {
+        messages.value[aiMessageIndex].content = `❌ 错误: ${errorMessage}`;
+      }
     }
   } finally {
     isLoading.value = false;
@@ -126,7 +136,9 @@ const sendMessage = async () => {
 };
 
 const createSession = async () => {
-  const response = await fetch('/api/session', {
+  console.log('createSession');
+
+  const response = await fetch(`${API_BASE}/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({})
@@ -136,9 +148,30 @@ const createSession = async () => {
   }
   const data = await response.json();
   currentSessionId.value = data.sessionId || '';
+  console.log('sessionId:', currentSessionId.value);
+
+  await loadHistory();
 };
 
-// 停止生成函数
+const loadHistory = async () => {
+  if (!currentSessionId.value) return;
+
+  try {
+    const response = await fetch(`${API_BASE}/history/${currentSessionId.value}`);
+    if (!response.ok) return;
+
+    const history = await response.json();
+    if (Array.isArray(history)) {
+      messages.value = history.map((msg: { role: string; content: string }) => ({
+        role: msg.role as 'user' | 'assistant',
+        content: msg.content
+      }));
+    }
+  } catch (error) {
+    console.error('加载历史记录失败:', error);
+  }
+};
+
 const stopGeneration = () => {
   if (abortController.value) {
     abortController.value.abort();
@@ -149,14 +182,14 @@ const scrollToBottom = () => {
   nextTick(() => {
     const container = document.querySelector('.chat-container');
     if (container) {
-      // 平滑滚动
       container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
     }
   });
-  onMounted(() => {
-    createSession();
-  });
 };
+
+onMounted(() => {
+  createSession();
+});
 </script>
 
 <template>
@@ -164,28 +197,16 @@ const scrollToBottom = () => {
     <div class="chat-container">
       <div v-for="(msg, index) in messages" :key="index" class="message" :class="msg.role">
         <div class="avatar">{{ msg.role === 'user' ? '👤' : '🤖' }}</div>
-        <div class="content" v-html="md.render(msg.content)"></div>
-      </div>
-
-      <!-- 思考中动画 -->
-      <div v-if="isThinking" class="message assistant">
-        <div class="avatar">🤖</div>
-        <div class="thinking-bubble">
-          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        <div class="content">
+          <div v-if="isThinking && msg.role === 'assistant' && !msg.content" class="thinking-bubble">
+            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          </div>
+          <span v-else v-html="md.render(msg.content)"></span>
         </div>
       </div>
     </div>
 
     <div class="input-area">
-      <!-- 停止按钮：仅在生成中显示 -->
-      <button
-        v-if="isLoading && !isThinking"
-        @click="stopGeneration"
-        class="stop-btn"
-      >
-        ⏹ 停止生成
-      </button>
-
       <div class="input-box">
         <input
           v-model="inputText"
@@ -193,8 +214,14 @@ const scrollToBottom = () => {
           :disabled="isLoading"
           placeholder="输入问题..."
         />
-        <button @click="sendMessage" :disabled="isLoading && !isThinking" class="send-btn">
-          {{ isLoading && !isThinking ? '生成中...' : '发送' }}
+        <button v-if="!isLoading" @click="sendMessage" class="send-btn">
+          发送
+        </button>
+        <button v-else-if="!isThinking" @click="stopGeneration" class="stop-btn">
+          ⏹ 停止生成
+        </button>
+        <button v-else disabled class="send-btn loading">
+          生成中...
         </button>
       </div>
     </div>
@@ -202,62 +229,78 @@ const scrollToBottom = () => {
 </template>
 
 <style scoped>
-.chat-container {
-  height: 60vh;
-  overflow-y: auto;
+.chat-wrapper {
+  max-width: 900px;
+  margin: 0 auto;
   padding: 20px;
-  background: #f9f9f9;
-  border-radius: 8px;
 }
+
+.chat-container {
+  height: 500px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 20px;
+  background: #fafafa;
+  margin-bottom: 20px;
+}
+
 .message {
   display: flex;
-  margin-bottom: 20px;
-  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 16px;
 }
-.message.user { flex-direction: row-reverse; }
-.avatar {
-  font-size: 24px;
-  margin: 0 10px;
+
+.message.user {
+  flex-direction: row-reverse;
 }
-.content {
+
+.message .avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #007bff;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.message.assistant .avatar {
+  background: #28a745;
+}
+
+.message .content {
   max-width: 70%;
   padding: 12px 16px;
   border-radius: 12px;
   background: white;
   box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-  line-height: 1.6;
 }
+
 .message.user .content {
   background: #007bff;
   color: white;
 }
-/* 代码块样式修正 */
-:deep(pre) {
-  background: #2d2d2d;
-  padding: 10px;
-  border-radius: 6px;
-  overflow-x: auto;
-  color: #ccc;
-}
-:deep(code) { font-family: 'Consolas', monospace; }
 
-/* 思考动画 */
 .thinking-bubble {
-  background: white;
-  padding: 10px 15px;
-  border-radius: 20px;
   display: flex;
-  gap: 5px;
+  gap: 4px;
+  padding: 12px 16px;
 }
-.dot {
+
+.thinking-bubble .dot {
   width: 8px;
   height: 8px;
-  background: #bbb;
   border-radius: 50%;
+  background: #999;
   animation: bounce 1.4s infinite ease-in-out both;
 }
-.dot:nth-child(1) { animation-delay: -0.32s; }
-.dot:nth-child(2) { animation-delay: -0.16s; }
+
+.thinking-bubble .dot:nth-child(1) { animation-delay: -0.32s; }
+.thinking-bubble .dot:nth-child(2) { animation-delay: -0.16s; }
 
 @keyframes bounce {
   0%, 80%, 100% { transform: scale(0); }
@@ -265,43 +308,57 @@ const scrollToBottom = () => {
 }
 
 .input-area {
-  margin-top: 20px;
   display: flex;
-  flex-direction: column;
   gap: 10px;
+  align-items: center;
 }
-.stop-btn {
-  align-self: center;
-  background: #ff4d4f;
-  color: white;
-  border: none;
-  padding: 6px 16px;
-  border-radius: 20px;
-  cursor: pointer;
-  font-size: 12px;
-  transition: opacity 0.3s;
-}
-.stop-btn:hover { opacity: 0.8; }
 
 .input-box {
   display: flex;
   gap: 10px;
-}
-input {
   flex: 1;
-  padding: 12px;
-  border: 1px solid #ddd;
-  border-radius: 8px;
-  outline: none;
 }
-input:disabled { background: #f0f0f0; }
+
+.input-box input {
+  flex: 1;
+  padding: 12px 16px;
+  border: 1px solid #ddd;
+  border-radius: 24px;
+  outline: none;
+  font-size: 14px;
+}
+
+.input-box input:focus {
+  border-color: #007bff;
+}
+
 .send-btn {
-  padding: 0 24px;
+  padding: 10px 24px;
   background: #007bff;
   color: white;
   border: none;
-  border-radius: 8px;
+  border-radius: 24px;
   cursor: pointer;
+  font-size: 14px;
 }
-.send-btn:disabled { background: #ccc; cursor: not-allowed; }
+
+.send-btn:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}
+
+.send-btn.loading {
+  background: #6c757d;
+  cursor: wait;
+}
+
+.stop-btn {
+  padding: 10px 16px;
+  background: #dc3545;
+  color: white;
+  border: none;
+  border-radius: 24px;
+  cursor: pointer;
+  font-size: 14px;
+}
 </style>
