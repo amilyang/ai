@@ -168,6 +168,7 @@ const loadHistory = async () => {
     if (!response.ok) return;
 
     const history = await response.json();
+    console.log('历史记录:', history);
     if (Array.isArray(history)) {
       messages.value = history.map((msg: { role: string; content: string }) => ({
         role: msg.role as 'user' | 'assistant',

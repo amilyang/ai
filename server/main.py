@@ -187,7 +187,8 @@ async def chat(req: ChatRequest):
                                     data = json.loads(content_str)
                                     content = data.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content", "")
                                     if content:
-                                        full_reply += content
+                                        # DashScope 返回的是累积内容，直接发送最新内容
+                                        full_reply = content
                                         # 发送 SSE 格式
                                         yield f"data: {json.dumps({'content': content})}\n\n"
                                 except json.JSONDecodeError:
