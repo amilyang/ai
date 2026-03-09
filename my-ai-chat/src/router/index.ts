@@ -15,7 +15,7 @@ const router = createRouter({
   routes: [
     {
       path: '/',
-      redirect: '/chat'
+      redirect: '/chat-stream'
     },
     {
       path: '/chat-stream',

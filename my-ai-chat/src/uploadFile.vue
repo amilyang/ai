@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref } from 'vue';
-import { ElMessage } from 'element-plus';
 import type { UploadFile, UploadRawFile } from 'element-plus';
+import { ElMessage } from 'element-plus';
+import { ref } from 'vue';
 
 const fileList = ref<UploadFile[]>([]);
 const isUploading = ref(false);
+const uploadStatus = ref<'idle' | 'uploading' | 'success' | 'error'>('idle');
 
 const beforeUpload = (file: UploadRawFile) => {
   const isTxt = file.name.endsWith('.txt');
@@ -18,6 +19,7 @@ const beforeUpload = (file: UploadRawFile) => {
     ElMessage.error('文件大小不能超过 10MB');
     return false;
   }
+  uploadStatus.value = 'idle';
   fileList.value = [{ ...file, status: 'ready' } as UploadFile];
   return true;
 };
@@ -34,6 +36,9 @@ const uploadFile = async () => {
   }
 
   isUploading.value = true;
+  uploadStatus.value = 'uploading';
+  ElMessage.info('正在向量化...');
+
   const formData = new FormData();
   formData.append('file', file.raw);
 
@@ -46,12 +51,16 @@ const uploadFile = async () => {
     const result = await response.json();
 
     if (response.ok) {
-      ElMessage.success(result.message || '上传成功');
+      uploadStatus.value = 'success';
+      ElMessage.success('✅ 学习完成！现在可以问我关于这个文档的问题了。');
     } else {
-      ElMessage.error(result.detail || '上传失败');
+      uploadStatus.value = 'error';
+      ElMessage.error('❌ 上传失败: ' + (result.detail || '未知错误'));
     }
   } catch (error) {
-    ElMessage.error('上传失败: ' + (error instanceof Error ? error.message : String(error)));
+    uploadStatus.value = 'error';
+    console.error('Upload error:', error);
+    ElMessage.error('❌ 网络错误');
   } finally {
     isUploading.value = false;
   }
@@ -59,6 +68,7 @@ const uploadFile = async () => {
 
 const handleRemove = () => {
   fileList.value = [];
+  uploadStatus.value = 'idle';
 };
 </script>
 
@@ -81,7 +91,7 @@ const handleRemove = () => {
       :before-upload="beforeUpload"
       :on-exceed="handleExceed"
       :on-remove="handleRemove"
-      accept=".txt"
+      accept=".txt,.md,.pdf"
     >
       <el-button type="primary">
         <el-icon class="el-icon--left"><Upload /></el-icon>
@@ -93,6 +103,18 @@ const handleRemove = () => {
         </div>
       </template>
     </el-upload>
+
+    <div class="upload-status" v-if="uploadStatus !== 'idle'">
+      <el-alert
+        :title="uploadStatus === 'uploading' ? '正在向量化...' :
+                uploadStatus === 'success' ? '学习完成！现在可以问我关于这个文档的问题了。' :
+                '上传失败'"
+        :type="uploadStatus === 'uploading' ? 'info' :
+               uploadStatus === 'success' ? 'success' : 'error'"
+        :closable="false"
+        show-icon
+      />
+    </div>
 
     <div class="upload-actions">
       <el-button
@@ -134,10 +156,11 @@ const handleRemove = () => {
   color: #999;
 }
 
+.upload-status {
+  margin-bottom: 20px;
+}
+
 .upload-actions {
-  display: flex;
-  justify-content: flex-end;
-  padding-top: 10px;
-  border-top: 1px solid #eee;
+  margin-top: 20px;
 }
 </style>
