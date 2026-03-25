@@ -504,7 +504,6 @@ async def delete_single_message(message_id: int):
             raise HTTPException(status_code=404, detail="消息不存在")
         session_id, role, created_at = row
         # 2. 找到对应的消息
-        # 2. 找到对应的消息
         if role == "user":
             # 删除用户消息时，删除对应的 AI 回复
             # 查找同一会话中，在该用户消息之后的第一条 assistant 消息
