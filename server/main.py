@@ -3,11 +3,11 @@ import json  # 处理 JSON 数据格式
 import time  # 时间相关，用于记录时间戳
 import sqlite3  # 数据库操作模块，用于 SQLite 数据库
 from typing import List, Optional   # 类型提示（让代码更规范）
-from contextlib import asynccontextmanager # 异步上下文管理器
-from pathlib import Path  # 处理文件路径
+from contextlib import asynccontextmanager
+from unittest import result # 异步上下文管理器
 
 import dashscope # 阿里云大模型 SDK
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File  # Web 框架
+from fastapi import FastAPI, HTTPException, UploadFile, File  # Web 框架
 from fastapi.middleware.cors import CORSMiddleware  # 跨域请求处理
 from fastapi.responses import StreamingResponse  #流式响应
 from pydantic import BaseModel # 数据验证
@@ -15,6 +15,7 @@ import httpx  # 异步 HTTP 客户端（发网络请求）
 import dotenv # 读取 .env 环境变量文件
 import chromadb  # 向量数据库（存 AI 理解的数据）
 from dashscope import TextEmbedding  # 文本向量化工具
+from dashscope import Generation  # 文本生成工具
 
 # 加载 .env 文件中的环境变量
 dotenv.load_dotenv()
@@ -49,6 +50,7 @@ def init_sqlite():
             session_id INTEGER,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
+            images TEXT DEFAULT '[]',  -- 新增：存储图片 URL 列表的 JSON 字符串
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(session_id) REFERENCES sessions(id)
         )
@@ -88,7 +90,8 @@ app.add_middleware(
 # --- 数据模型 ---
 class ChatRequest(BaseModel):
     sessionId: int
-    message: str
+    message: str = ""
+    images: Optional[List[str]] = None
 
 class SessionCreate(BaseModel):
     title: Optional[str] = "新对话"
@@ -130,6 +133,16 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
     return chunks
 
 # --- API 接口 ---
+# --- 新增 API: 获取所有会话列表 ---
+@app.get("/api/sessions")
+async def list_sessions():
+    conn = await get_db_connection()
+    c = conn.cursor()
+    # 按时间倒序排列，最新的在最前
+    c.execute("SELECT id, title, created_at FROM sessions ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": row["id"], "title": row["title"], "createdAt": row["created_at"]} for row in rows]
 
 @app.post("/api/session")
 async def create_session(req: SessionCreate):
@@ -140,15 +153,49 @@ async def create_session(req: SessionCreate):
     conn.commit()
     conn.close()
     return {"sessionId": session_id}
+# --- 新增 API: 删除会话 ---
+@app.delete("/api/session/{session_id}")
+async def delete_session(session_id: int):
+    conn = await get_db_connection()
+    c = conn.cursor()
+    # 先删除会话中的所有消息
+    c.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+    # 再删除会话本身
+    c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "会话已删除"}
+# --- 新增 API: 更新会话标题 ---
+@app.put("/api/session/{session_id}")
+async def update_session_title(session_id: int, title_data: dict):
+    # title_data 期望格式: {"title": "新标题"}
+    new_title = title_data.get('title')
+    if not new_title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    conn = await get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE sessions SET title = ? WHERE id = ?", (new_title, session_id))
+    conn.commit()
+    conn.close()
+    return {"message": "会话标题已更新"}
 
 @app.get("/api/history/{session_id}")
 async def get_history(session_id: int):
     conn = await get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
+    c.execute("SELECT role, content, images FROM messages WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
     rows = c.fetchall()
     conn.close()
-    return [{"role": row["role"], "content": row["content"]} for row in rows]
+
+    print(f"查询会话 {session_id} 的历史记录: 共 {len(rows)} 条")
+    result = []
+    for row in rows:
+        try:
+            imgList = json.loads(row["images"]) if row["images"] else []
+        except json.JSONDecodeError:
+            imgList = []
+        result.append({"role": row["role"], "content": row["content"], "images": imgList})
+    return result
 
 @app.post("/api/upload")
 async def upload_knowledge(file: UploadFile = File(...)):
@@ -206,32 +253,38 @@ async def upload_knowledge(file: UploadFile = File(...)):
 
     return {"message": f"成功学习 {len(embeddings)} 个知识片段", "filename": file.filename}
 
+# --- 新增 API: 与 AI 交互 ---
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    if not req.message or not req.sessionId:
+    # message 为必填项
+    if not req.sessionId or not req.message:
         raise HTTPException(status_code=400, detail="Missing sessionId or message")
 
     conn = await get_db_connection()
     c = conn.cursor()
 
+    # 将图片列表序列化为 JSON 字符串，如果没有图片则存 '[]'
+    images_json = json.dumps(req.images) if req.images else '[]'
+
     # 1. 保存用户消息
-    c.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
-              (req.sessionId, "user", req.message))
+    c.execute("INSERT INTO messages (session_id, role, content, images) VALUES (?, ?, ?, ?)",
+              (req.sessionId, "user", req.message, images_json))
     conn.commit()
 
-    # 2. RAG 检索：查找相关知识
+    # 2. RAG 检索：查找相关知识（仅在有文字消息时进行）
     relevant_chunks = []
-    try:
-        query_emb = get_embedding(req.message)
-        if query_emb:
-            results = chroma_collection.query(
-                query_embeddings=[query_emb],
-                n_results=3
-            )
-            if results and results['documents']:
-                relevant_chunks = results['documents'][0]
-    except Exception as e:
-        print(f"RAG Search Error: {e}")
+    if req.message and req.message.strip():
+        try:
+            query_emb = get_embedding(req.message)
+            if query_emb:
+                results = chroma_collection.query(
+                    query_embeddings=[query_emb],
+                    n_results=3
+                )
+                if results and results['documents']:
+                    relevant_chunks = results['documents'][0]
+        except Exception as e:
+            print(f"RAG Search Error: {e}")
 
     # 3. 构建上下文
     context_str = ""
@@ -253,65 +306,236 @@ async def chat(req: ChatRequest):
 
     conn.close()
 
-    # 5. 组装 Payload
+    # 5. 组装 Payload - 支持多模态
+    model_name = "qwen-turbo"
     payload_messages = [
         {"role": "system", "content": system_prompt},
         *history,
-        {"role": "user", "content": req.message}
     ]
+
+    # 预处理图片数据：直接使用原始 data URL（不提取base64）
+    processed_images = []
+    if req.images and len(req.images) > 0:
+        for img_url in req.images:
+            # 直接保留原始 data URL 格式
+            processed_images.append(img_url)
+
+    # 如果有图片，使用 Qwen-VL 模型
+    if processed_images and len(processed_images) > 0:
+        model_name = "qwen-vl-plus"
+        # 构建多模态消息 - 使用 image_url 对象格式
+        image_contents = []
+        print(f"收到图片数量: {len(processed_images)}")
+        for i, img_url in enumerate(processed_images):
+            print(f"图片 {i+1}: {img_url[:50]}...")
+            # 使用 image_url 对象格式
+            image_contents.append({"image": img_url})
+        # 添加文字描述
+        image_contents.append({"text": req.message or "请描述这张图片"})
+        print(f"最终 content: {image_contents}")
+        payload_messages.append({"role": "user", "content": image_contents})
+    else:
+        payload_messages.append({"role": "user", "content": req.message})
 
     # 6. 定义流式生成器
     async def generate_stream():
         full_reply = ""
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    "POST",
-                    "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-                    headers={
-                        "Authorization": f"Bearer {API_KEY}",
-                        "Content-Type": "application/json",
-                        "X-DashScope-SSE": "enable"
-                    },
-                    json={
-                        "model": "qwen-turbo",
-                        "input": {"messages": payload_messages},
-                        "parameters": {"result_format": "message"}
-                    }
-                ) as response:
-                    if response.status_code != 200:
-                        error_text = await response.aread()
-                        yield f"data: {json.dumps({'error': f'API Error: {response.status_code}'})}\n\n"
-                        return
+            # 如果有图片，使用 HTTP API 调用 Qwen-VL
+            if processed_images and len(processed_images) > 0:
+                # 直接使用已经构建好的 payload_messages（包含完整 data URL）
+                mm_messages = payload_messages.copy()
 
-                    async for line in response.aiter_lines():
-                        if line.startswith("data:"):
-                            content_str = line[5:].strip()
-                            if content_str and content_str != "[DONE]":
-                                try:
-                                    data = json.loads(content_str)
-                                    content = data.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content", "")
-                                    if content:
-                                        full_reply = content
-                                        yield f"data: {json.dumps({'content': content})}\n\n"
-                                except json.JSONDecodeError:
-                                    continue
+                print(f"多模态消息图片数量: {len(processed_images)}, 第一张长度: {len(processed_images[0]) if processed_images else 0}")
 
-                    # 7. 流结束后，保存 AI 回复到数据库
-                    save_conn = await get_db_connection()
-                    save_c = save_conn.cursor()
-                    save_c.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
-                                   (req.sessionId, "assistant", full_reply))
-                    save_conn.commit()
-                    save_conn.close()
+                # 打印发送给 API 的完整请求体
+                api_request = {
+                    "model": model_name,
+                    "input": {"messages": mm_messages},
+                    "parameters": {"result_format": "message"}
+                }
+                print(f"API Request: {json.dumps(api_request, ensure_ascii=False)[:500]}...")
 
-                    yield "data: [DONE]\n\n"
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        "POST",
+                        "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                        headers={
+                            "Authorization": f"Bearer {API_KEY}",
+                            "Content-Type": "application/json",
+                            "X-DashScope-SSE": "enable"
+                        },
+                        json={
+                            "model": model_name,
+                            "input": {"messages": mm_messages},
+                            "parameters": {"result_format": "message"}
+                        }
+                    ) as response:
+                        print(f"API response status: {response.status_code}")
+                        if response.status_code != 200:
+                            error_text = await response.aread()
+                            print(f"API error: {response.status_code} - {error_text}")
+                            yield f"data: {json.dumps({'error': f'API Error: {response.status_code}', 'details': error_text.decode()})}\n\n"
+                            return
+
+                        async for line in response.aiter_lines():
+                            if line.startswith("data:"):
+                                content_str = line[5:].strip()
+                                if content_str and content_str != "[DONE]":
+                                    try:
+                                        data = json.loads(content_str)
+                                        print(f"VL Response: {data}")
+
+                                        # 修复：正确解析多模态响应
+                                        output = data.get("output", {})
+                                        choices = output.get("choices", [])
+                                        if choices:
+                                            choice = choices[0]
+                                            message = choice.get("message", {})
+                                            content_obj = message.get("content", [])
+
+                                            # 多模态返回通常是列表，包含 image 和 text
+                                            text_content = ""
+                                            for item in content_obj:
+                                                if item.get("text"):
+                                                    text_content += item.get("text", "")
+
+                                            if text_content:
+                                                # 直接使用完整内容作为最新状态
+                                                new_content = text_content[len(full_reply):]
+                                                full_reply = text_content
+                                                if new_content:
+                                                    yield f"data: {json.dumps({'content': new_content})}\n\n"
+                                    except json.JSONDecodeError:
+                                        print(f"JSON decode error on line: {line}")
+                                        continue
+                                    except Exception as e:
+                                        print(f"Error processing response line: {e}")
+                                        continue
+                            elif line == "[DONE]":
+                                break
+            else:
+                # 文本模式使用 HTTP 调用
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        "POST",
+                        "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+                        headers={
+                            "Authorization": f"Bearer {API_KEY}",
+                            "Content-Type": "application/json",
+                            "X-DashScope-SSE": "enable"
+                        },
+                        json={
+                            "model": model_name,
+                            "input": {"messages": payload_messages},
+                            "parameters": {"result_format": "message"}
+                        }
+                    ) as response:
+                        if response.status_code != 200:
+                            error_text = await response.aread()
+                            yield f"data: {json.dumps({'error': f'API Error: {response.status_code}'})}\n\n"
+                            return
+
+                        async for line in response.aiter_lines():
+                            if line.startswith("data:"):
+                                content_str = line[5:].strip()
+                                if content_str and content_str != "[DONE]":
+                                    try:
+                                        data = json.loads(content_str)
+                                        content = data.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content", "")
+                                        print(f"Text Response: {content}")
+                                        if content:
+                                            # 累加发送内容
+                                            new_content = content[len(full_reply):]
+                                            full_reply = content  # 直接使用完整内容作为最新状态
+                                            print(f"Full reply: {full_reply}, New content: {new_content}")
+                                            if new_content:
+                                                yield f"data: {json.dumps({'content': new_content})}\n\n"
+                                    except json.JSONDecodeError:
+                                        continue
+
+            # 7. 流结束后，保存 AI 回复到数据库
+            save_conn = await get_db_connection()
+            save_c = save_conn.cursor()
+            save_c.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                           (req.sessionId, "assistant", full_reply))
+            save_conn.commit()
+            save_conn.close()
+
+            yield "data: [DONE]\n\n"
 
         except Exception as e:
             print(f"Stream Error: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
+#--- 新增API：删除/修改某条特定消息（用于编辑功能）----
+# 策略：当用户编辑某条消息时，我们删除该消息之后的所有消息（包括它自己）
+# 然后插入新的用户消息，触发重新生成
+@app.delete("/api/message/{message_id}")
+async def delete_message(message_id: int):
+    # 这是一个简化策略：找到这条消息的 session，删除这条消息及其之后的所有消息
+    conn = await get_db_connection()
+    c = conn.cursor()
+   # 1. 找到这条消息的 session_id 和 created_at
+    c.execute("SELECT session_id, created_at FROM messages WHERE id = ?", (message_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="消息不存在")
+    session_id, created_at = row['session_id'], row['created_at']
+    # 2. 删除该时间点之后的所有消息 (包含这条)
+    c.execute("DELETE FROM messages WHERE session_id = ? AND created_at >= ?", (session_id, created_at))
+    conn.commit()
+    conn.close()
+    return {"message": "消息已删除", "sessionId": session_id}
+
+# 删除单条消息
+@app.delete("/api/msg/{message_id}")
+async def delete_single_message(message_id: int):
+    conn = await get_db_connection()
+    c = conn.cursor()
+    try:
+        # 获取要删除的消息信息
+        c.execute("SELECT session_id, role, created_at FROM messages WHERE id = ?", (message_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="消息不存在")
+        session_id, role, created_at = row
+        # 2. 找到对应的消息
+        # 2. 找到对应的消息
+        if role == "user":
+            # 删除用户消息时，删除对应的 AI 回复
+            # 查找同一会话中，在该用户消息之后的第一条 assistant 消息
+            c.execute('''
+                SELECT id FROM messages
+                WHERE session_id = ? AND role = 'assistant' AND created_at > ?
+                ORDER BY created_at ASC LIMIT 1
+            ''', (session_id, created_at))
+            assistant_msg = c.fetchone()
+            if assistant_msg:
+                c.execute("DELETE FROM messages WHERE id = ?", (assistant_msg[0],))
+        else:  # role == "assistant"
+            # 删除 AI 回复时，删除对应的用户消息
+            # 查找同一会话中，在该回复之前的最后一条 user 消息
+            c.execute('''
+                SELECT id FROM messages
+                WHERE session_id = ? AND role = 'user' AND created_at < ?
+                ORDER BY created_at DESC LIMIT 1
+            ''', (session_id, created_at))
+            user_msg = c.fetchone()
+            if user_msg:
+                c.execute("DELETE FROM messages WHERE id = ?", (user_msg[0],))
+
+        # 3. 删除原始消息
+        c.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        conn.commit()
+        conn.close()
+        return {"message": "消息已删除"}
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"删除消息失败: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

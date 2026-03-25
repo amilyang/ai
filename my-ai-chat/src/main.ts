@@ -2,7 +2,7 @@
  * @Author: e0042176 e0042176@ceic.com
  * @Date: 2026-03-03 10:33:14
  * @LastEditors: e0042176 e0042176@ceic.com
- * @LastEditTime: 2026-03-04 14:38:34
+ * @LastEditTime: 2026-03-10 10:14:56
  * @FilePath: \ai\my-ai-chat\src\main.ts
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -14,6 +14,7 @@ import { createApp } from 'vue'
 
 import App from './App.vue'
 import router from './router'
+import './style.css'
 
 const app = createApp(App)
 
