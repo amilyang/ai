@@ -1,150 +1,116 @@
 # server/rag_engine.py
+import os
 import chromadb
+from dashscope import TextEmbedding
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder
 import numpy as np
-import pdfplumber
+from typing import List, Dict
 import re
 
-class AdvancedRAGEngine:
-    def __init__(self, persist_directory="./db"):
-        # 1. 向量数据库 (保持原有)
-        self.client = chromadb.PersistentClient(path=persist_directory)
-        self.collection = self.client.get_or_create_collection("advanced_rag")
+# 1. 初始化 ChromaDB
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="knowledge_base")
 
-        # 2. BM25 索引 (关键词)
-        self.bm25_index = None
-        self.documents_map = {} # 映射 ID -> 原文内容
+# 2. 内存中的 BM25 索引 (简单起见，每次启动重新构建，生产环境需持久化)
+bm25_index = None
+bm25_texts = []
 
-        # 3. Re-ranker 模型 (使用跨编码器进行精细排序)
-        # 推荐模型: BAAI/bge-reranker-base (中文效果好) 或 cross-encoder/ms-marco-MiniLM-L-6-v2
-        print("Loading Re-ranker model...")
-        self.reranker = CrossEncoder('BAAI/bge-reranker-base', device='cpu') # 有 GPU 可改为 'cuda'
-        print("Re-ranker loaded.")
+def get_embedding(text: str):
+    response = TextEmbedding.call(model="text-embedding-v2", input=text)
+    if response.status_code == 200:
+        return response.output['embeddings'][0]['embedding']
+    return None
 
-    def preprocess_text(self, text):
-        """简单的文本清洗"""
-        return re.sub(r'\s+', ' ', text).strip()
+def preprocess_text(text):
+    # 简单的分词，中文可以使用 jieba，这里为了演示用空格和正则简单处理
+    return re.findall(r'\w+', text.lower())
 
-    def ingest_pdf_advanced(self, file_path, metadata):
-        """
-        高级 PDF 解析：使用 pdfplumber 更好地处理表格和布局
-        """
-        chunks = []
-        with pdfplumber.open(file_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                # 策略：先提取表格，再提取文本
-                tables = page.extract_tables()
-                for table in tables:
-                    # 将表格转换为 Markdown 格式，LLM 更容易理解
-                    md_table = "\n".join(["| " + " | ".join([str(cell) for cell in row]) + " |" for row in table])
-                    chunks.append({
-                        "content": f"[Table from Page {i+1}]\n{md_table}",
-                        "metadata": {**metadata, "page": i+1, "type": "table"}
-                    })
+def build_bm25_index():
+    global bm25_index, bm25_texts
+    # 获取所有文档
+    all_docs = collection.get(include=['documents'])
+    bm25_texts = all_docs['documents']
+    if bm25_texts:
+        # 实际中文项目建议用 jieba.analyse 或 jieba.cut 进行分词
+        tokenized_docs = [preprocess_text(t) for t in bm25_texts]
+        bm25_index = BM25Okapi(tokenized_docs)
+        print(f"✅ BM25 索引已重建，共 {len(bm25_texts)} 个片段")
 
-                # 提取普通文本
-                text = page.extract_text()
-                if text:
-                    # 简单的按段落分块 (实际生产中可用更复杂的递归分块)
-                    paragraphs = text.split('\n\n')
-                    for p in paragraphs:
-                        if len(p.strip()) > 50: # 过滤太短的片段
-                            chunks.append({
-                                "content": self.preprocess_text(p),
-                                "metadata": {**metadata, "page": i+1, "type": "text"}
-                            })
+def add_document(texts: List[str], ids: List[str], metadatas: List[Dict]):
+    # 1. 获取向量
+    embeddings = []
+    for text in texts:
+        emb = get_embedding(text)
+        if emb: embeddings.append(emb)
 
-        # 存入向量库
-        if chunks:
-            self.collection.add(
-                documents=[c["content"] for c in chunks],
-                metadatas=[c["metadata"] for c in chunks],
-                ids=[f"{metadata['source']}_{i}" for i in range(len(chunks))]
-            )
+    if not embeddings: return False
 
-            # 更新 BM25 索引
-            self._update_bm25([c["content"] for c in chunks], [f"{metadata['source']}_{i}" for i in range(len(chunks))])
+    # 2. 存入 Chroma
+    collection.add(documents=texts, ids=ids, metadatas=metadatas, embeddings=embeddings)
 
-        return len(chunks)
+    # 3. 重建 BM25 索引
+    build_bm25_index()
+    return True
 
-    def _update_bm25(self, new_docs, new_ids):
-        """更新 BM25 索引"""
-        # 简单策略：重新构建整个索引 (数据量大时需用增量更新或持久化存储)
-        all_docs = []
-        all_ids = []
+def query_knowledge(query: str, top_k: int = 3):
+    # === 阶段 1: 向量检索 (召回 10 个) ===
+    query_emb = get_embedding(query)
+    vector_results = collection.query(query_embeddings=[query_emb], n_results=10)
+    vector_docs = vector_results['documents'][0]
+    vector_ids = vector_results['ids'][0]
 
-        # 合并现有文档
-        for doc_id, doc in self.documents_map.items():
-            all_docs.append(doc)
-            all_ids.append(doc_id)
+    # === 阶段 2: BM25 关键词检索 (召回 10 个) ===
+    bm25_results = []
+    if bm25_index:
+        query_tokens = preprocess_text(query)
+        scores = bm25_index.get_scores(query_tokens)
+        # 取前 10 个高分
+        top_indices = np.argsort(scores)[::-1][:10]
+        for idx in top_indices:
+            if scores[idx] > 0: # 过滤掉 0 分
+                bm25_results.append({
+                    "id": collection.get(ids=[collection.get()['ids'][idx]])['ids'][0], # 这里简化处理，实际需对应
+                    "text": bm25_texts[idx],
+                    "score": scores[idx]
+                })
 
-        # 添加新文档
-        for doc, doc_id in zip(new_docs, new_ids):
-            self.documents_map[doc_id] = doc
-            all_docs.append(doc)
-            all_ids.append(doc_id)
+    # === 阶段 3: 合并与去重 ===
+    # 简单合并，实际项目中需要更复杂的去重逻辑
+    all_candidates = []
 
-        # 分词 (中文需要简单分词，这里用空格模拟，生产环境建议用 jieba)
-        tokenized_docs = [doc.split() for doc in all_docs]
-        self.bm25_index = BM25Okapi(tokenized_docs)
-        self.bm25_ids = all_ids
+    # 添加向量检索结果
+    for doc, doc_id in zip(vector_docs, vector_ids):
+        all_candidates.append({"id": doc_id, "text": doc, "source": "vector"})
 
-    def retrieve(self, query, top_k=5):
-        """
-        混合检索 + 重排序流程
-        """
-        # 1. 向量检索 (Dense Retrieval) - 捕捉语义
-        vector_results = self.collection.query(
-            query_texts=[query],
-            n_results=top_k * 2 # 先多取一些，供重排序筛选
-        )
+    # 添加 BM25 结果 (这里为了演示简化了 ID 获取，实际应直接从 collection 获取)
+    # 注意：上面的 bm25 获取 ID 方式在 Chroma 中比较复杂，
+    # 实际建议直接遍历 bm25_texts 并匹配索引。
+    # 这里我们直接用文本内容去重。
+    existing_texts = set([c['text'] for c in all_candidates])
+    for item in bm25_results:
+        if item['text'] not in existing_texts:
+            all_candidates.append({"id": f"bm25_{item['id']}", "text": item['text'], "source": "bm25"})
 
-        # 2. BM25 检索 (Sparse Retrieval) - 捕捉精确关键词
-        bm25_scores = []
-        if self.bm25_index:
-            tokenized_query = query.split()
-            scores = self.bm25_index.get_scores(tokenized_query)
-            # 获取 Top K 的 BM25 结果
-            top_indices = np.argsort(scores)[::-1][:top_k * 2]
-            bm25_results = {
-                "ids": [[self.bm25_ids[i]] for i in top_indices],
-                "documents": [[self.documents_map[self.bm25_ids[i]]] for i in top_indices],
-                "distances": [[scores[i]] for i in top_indices] # 分数越高越好
-            }
-        else:
-            bm25_results = {"ids": [[]], "documents": [[]], "distances": [[]]}
+    # === 阶段 4: 重排序 (Re-ranking) ===
+    # 这里模拟 Re-ranker 效果。
+    # 真正的 Re-ranker 需要调用 Cross-Encoder 模型 (如 BGE-Reranker)。
+    # 为了演示，我们假设向量检索的结果权重更高，或者简单截断。
+    # 如果你有 BGE-Reranker API，可以在这里调用，输入 query 和所有 candidate texts，获取分数排序。
 
-        # 3. 融合结果 (Reciprocal Rank Fusion 或 简单去重合并)
-        # 这里采用简单合并去重策略
-        seen_ids = set()
-        merged_candidates = []
+    # 简单策略：优先取向量检索的结果，如果不够，再补 BM25 的
+    final_results = []
+    seen_texts = set()
 
-        # 添加向量结果
-        for id, doc in zip(vector_results['ids'][0], vector_results['documents'][0]):
-            if id not in seen_ids:
-                merged_candidates.append({"id": id, "content": doc, "source": "vector"})
-                seen_ids.add(id)
+    # 先加向量结果
+    for item in all_candidates:
+        if item['source'] == 'vector' and item['text'] not in seen_texts:
+            final_results.append(item['text'])
+            seen_texts.add(item['text'])
 
-        # 添加 BM25 结果
-        for id, doc in zip(bm25_results['ids'][0], bm25_results['documents'][0]):
-            if id not in seen_ids:
-                merged_candidates.append({"id": id, "content": doc, "source": "bm25"})
-                seen_ids.add(id)
+    # 再加 BM25 结果 (补充多样性)
+    for item in all_candidates:
+        if item['source'] == 'bm25' and item['text'] not in seen_texts:
+            final_results.append(item['text'])
+            seen_texts.add(item['text'])
 
-        if not merged_candidates:
-            return []
-
-        # 4. 重排序 (Re-ranking) - 关键步骤!
-        # 使用 CrossEncoder 对 (Query, Document) 对进行打分
-        pairs = [[query, cand["content"]] for cand in merged_candidates]
-        rerank_scores = self.reranker.predict(pairs)
-
-        # 附加分数到候选项
-        for i, score in enumerate(rerank_scores):
-            merged_candidates[i]["score"] = score
-
-        # 5. 按重排序分数降序排列，取最终 Top K
-        final_results = sorted(merged_candidates, key=lambda x: x["score"], reverse=True)[:top_k]
-
-        return final_results
+    return final_results[:top_k] # 返回前 top_k 个

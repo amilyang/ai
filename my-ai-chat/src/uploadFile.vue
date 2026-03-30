@@ -77,7 +77,7 @@ const handleRemove = () => {
     <template #header>
       <div class="card-header">
         <span class="title">上传文档</span>
-        <el-tag type="info">仅支持 .txt 格式</el-tag>
+        <el-tag type="info">仅支持 .txt, .md, .pdf 格式</el-tag>
       </div>
     </template>
 

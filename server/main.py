@@ -4,7 +4,6 @@ import time  # 时间相关，用于记录时间戳
 import sqlite3  # 数据库操作模块，用于 SQLite 数据库
 from typing import List, Optional   # 类型提示（让代码更规范）
 from contextlib import asynccontextmanager
-from unittest import result # 异步上下文管理器
 
 import dashscope # 阿里云大模型 SDK
 from fastapi import FastAPI, HTTPException, UploadFile, File  # Web 框架
@@ -16,6 +15,30 @@ import dotenv # 读取 .env 环境变量文件
 import chromadb  # 向量数据库（存 AI 理解的数据）
 from dashscope import TextEmbedding  # 文本向量化工具
 from dashscope import Generation  # 文本生成工具
+import chardet  # 文件编码检测库
+
+# 尝试导入 sentence-transformers 作为本地嵌入备选
+local_embedding_model = None
+local_embedding_available = False
+try:
+    from sentence_transformers import SentenceTransformer
+    local_embedding_available = True
+    print("[OK] 本地嵌入模型库已就绪")
+except Exception as e:
+    print(f"[WARN] 本地嵌入模型库不可用: {e}")
+
+# 延迟加载本地嵌入模型
+def load_local_embedding_model():
+    global local_embedding_model
+    if local_embedding_available and local_embedding_model is None:
+        try:
+            local_embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            print("[OK] 本地嵌入模型已加载: all-MiniLM-L6-v2")
+            return local_embedding_model
+        except Exception as e:
+            print(f"[WARN] 无法加载本地嵌入模型: {e}")
+            return None
+    return local_embedding_model
 
 # 加载 .env 文件中的环境变量
 dotenv.load_dotenv()
@@ -25,17 +48,27 @@ API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 从环境变量读取 API 密钥
 DB_PATH = "chat.db"  # 数据库文件名
 CHROMA_PERSIST_DIR = "./chroma_db"  #向量数据库存储目录
 
+# 模型配置
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen-turbo")  # 默认使用 qwen-turbo
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")  # 默认使用 text-embedding-v2
+
+# 文本处理配置
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 500))  # 文本分块大小
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 50))  # 文本分块重叠大小
+MAX_RELEVANT_CHUNKS = int(os.getenv("MAX_RELEVANT_CHUNKS", 3))  # 最大相关知识片段数
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", 10))  # 最大历史消息数
+
 # 设置 dashscope API Key
 dashscope.api_key = API_KEY # 告诉 dashscope 你的密钥
 
 if not API_KEY:
-    raise ValueError("❌ 错误: 请在 .env 文件中设置 DASHSCOPE_API_KEY")
+    raise ValueError("错误: 请在 .env 文件中设置 DASHSCOPE_API_KEY")
 
 # --- 数据库初始化 (SQLite) ---
 def init_sqlite():
     conn = sqlite3.connect(DB_PATH) # 连接数据库（没有就创建）
     c = conn.cursor() # 获取"指针"，用来执行 SQL 命令
-     # 创建 sessions 表（存储对话会话）
+    # 创建 sessions 表（存储对话会话）
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +76,7 @@ def init_sqlite():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-     # 创建 messages 表（存储消息）
+    # 创建 messages 表（存储消息）
     c.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,13 +90,13 @@ def init_sqlite():
     ''')
     conn.commit() # 提交保存
     conn.close() # 关闭连接
-    print(f"✅ SQLite 数据库已初始化: {DB_PATH}")
+    print(f"[DB] SQLite 数据库已初始化: {DB_PATH}")
 
 # --- 向量数据库初始化 (ChromaDB) ---
 def init_chroma():
     client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR) # 创建持久化客户端
     collection = client.get_or_create_collection(name="knowledge_base") # 获取/创建集合
-    print(f"✅ ChromaDB 向量库已初始化: {CHROMA_PERSIST_DIR}")
+    print(f"[DB] ChromaDB 向量库已初始化: {CHROMA_PERSIST_DIR}")
     return collection
 
 # 全局变量存储 Chroma 集合
@@ -97,7 +130,6 @@ class SessionCreate(BaseModel):
     title: Optional[str] = "新对话"
 
 # --- 辅助函数 ---
-
 async def get_db_connection():
     """获取数据库连接"""
     conn = sqlite3.connect(DB_PATH)
@@ -106,22 +138,43 @@ async def get_db_connection():
 
 def get_embedding(text: str):
     """调用阿里云 DashScope 获取文本向量"""
+    # 尝试使用阿里云 API
     try:
         response = TextEmbedding.call(
-            model="text-embedding-v2",  # 向量化模型
+            model=EMBEDDING_MODEL,  # 使用配置的向量化模型
             input=text
         )
         if response.status_code == 200:
             return response.output['embeddings'][0]['embedding']
         else:
-            print(f"❌ Embedding Error: {response.status_code} - {response.message}")
-            return None
+            print(f"[ERROR] Embedding Error: {response.status_code} - {response.message}")
+            # 尝试使用其他模型
+            print("[INFO] 尝试使用 text-embedding-v1 模型...")
+            try:
+                response_v1 = TextEmbedding.call(
+                    model="text-embedding-v1",  # 尝试使用 v1 模型
+                    input=text
+                )
+                if response_v1.status_code == 200:
+                    return response_v1.output['embeddings'][0]['embedding']
+                else:
+                    print(f"[ERROR] Embedding v1 Error: {response_v1.status_code} - {response_v1.message}")
+                    return None
+            except Exception as e:
+                print(f"[ERROR] Embedding v1 Exception: {e}")
+                return None
     except Exception as e:
-        print(f"❌ Embedding Exception: {e}")
+        print(f"[ERROR] Embedding Exception: {e}")
         return None
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
+def chunk_text(text: str, chunk_size: int = None, overlap: int = None):
     """简单的文本切片逻辑"""
+    # 使用配置值作为默认值
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+    if overlap is None:
+        overlap = CHUNK_OVERLAP
+
     chunks = []
     start = 0
     while start < len(text):
@@ -144,56 +197,29 @@ async def list_sessions():
     conn.close()
     return [{"id": row["id"], "title": row["title"], "createdAt": row["created_at"]} for row in rows]
 
-@app.post("/api/session")
-async def create_session(req: SessionCreate):
+# --- 新增 API: 创建新会话 ---
+@app.post("/api/sessions")
+async def create_session(session: SessionCreate):
     conn = await get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO sessions (title) VALUES (?)", (req.title,))
-    session_id = c.lastrowid # 获取刚创建的 ID
+    c.execute("INSERT INTO sessions (title) VALUES (?)", (session.title,))
+    session_id = c.lastrowid
     conn.commit()
     conn.close()
-    return {"sessionId": session_id}
-# --- 新增 API: 删除会话 ---
-@app.delete("/api/session/{session_id}")
-async def delete_session(session_id: int):
-    conn = await get_db_connection()
-    c = conn.cursor()
-    # 先删除会话中的所有消息
-    c.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-    # 再删除会话本身
-    c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-    conn.commit()
-    conn.close()
-    return {"message": "会话已删除"}
-# --- 新增 API: 更新会话标题 ---
-@app.put("/api/session/{session_id}")
-async def update_session_title(session_id: int, title_data: dict):
-    # title_data 期望格式: {"title": "新标题"}
-    new_title = title_data.get('title')
-    if not new_title:
-        raise HTTPException(status_code=400, detail="Title is required")
-    conn = await get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE sessions SET title = ? WHERE id = ?", (new_title, session_id))
-    conn.commit()
-    conn.close()
-    return {"message": "会话标题已更新"}
+    return {"id": session_id, "title": session.title}
 
-@app.get("/api/history/{session_id}")
-async def get_history(session_id: int):
+# --- 新增 API: 获取会话历史 ---
+@app.get("/api/sessions/{session_id}")
+async def get_session_history(session_id: int):
     conn = await get_db_connection()
     c = conn.cursor()
     c.execute("SELECT role, content, images FROM messages WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
     rows = c.fetchall()
     conn.close()
 
-    print(f"查询会话 {session_id} 的历史记录: 共 {len(rows)} 条")
     result = []
     for row in rows:
-        try:
-            imgList = json.loads(row["images"]) if row["images"] else []
-        except json.JSONDecodeError:
-            imgList = []
+        imgList = json.loads(row["images"]) if row["images"] else []
         result.append({"role": row["role"], "content": row["content"], "images": imgList})
     return result
 
@@ -209,14 +235,31 @@ async def upload_knowledge(file: UploadFile = File(...)):
         pass
 
     try:
-         # 1. 读取文件内容
+        # 1. 读取文件内容
         content = await file.read()
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="File encoding error. Please use UTF-8 text files.")
+        print(f"[FILE] 文件大小: {len(content)} 字节")
+
+        # 2. 检测文件编码
+        result = chardet.detect(content)
+        encoding = result['encoding'] or 'utf-8'  # 如果检测失败，默认使用 utf-8
+        confidence = result['confidence']
+        print(f"[FILE] 检测到文件编码: {encoding} (置信度: {confidence:.2f})")
+
+        # 3. 解码文件内容
+        try:
+            text = content.decode(encoding)
+            print(f"[OK] 成功解码文件，内容长度: {len(text)} 字符")
+        except UnicodeDecodeError as e:
+            # 如果解码失败，尝试使用 utf-8 解码并忽略错误
+            print(f"[WARN] 使用 {encoding} 解码失败: {e}，尝试使用 utf-8 解码并忽略错误")
+            text = content.decode('utf-8', errors='replace')
+            print(f"[OK] 使用 utf-8 解码成功，内容长度: {len(text)} 字符")
+    except Exception as e:
+        print(f"[ERROR] 文件读取错误: {e}")
+        raise HTTPException(status_code=400, detail="File reading error. Please check the file format.")
 
     doc_id = f"doc_{int(time.time())}_{file.filename}"
-     # 2. 切分文本
+    # 2. 切分文本
     chunks = chunk_text(text)
 
     if not chunks:
@@ -227,7 +270,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
     embeddings = []
     metadatas = []
 
-    print(f"📚 正在处理 {len(chunks)} 个文本块...")
+    print(f"[INFO] 正在处理 {len(chunks)} 个文本块...")
 
     # 3. 向量化每个小块并存入 ChromaDB
     for i, chunk in enumerate(chunks):
@@ -238,10 +281,12 @@ async def upload_knowledge(file: UploadFile = File(...)):
             embeddings.append(emb)
             metadatas.append({"source": file.filename, "doc_id": doc_id})
         else:
-            print(f"⚠️ 跳过第 {i} 块，向量化失败")
+            print(f"[WARN] 跳过第 {i} 块，向量化失败")
 
     if not embeddings:
-        raise HTTPException(status_code=500, detail="Failed to generate embeddings")
+        # 如果无法生成嵌入，仍然返回成功，只是提示无法进行知识检索
+        print("[WARN] 无法生成向量嵌入，文件上传成功但无法进行知识检索")
+        return {"message": "文件上传成功，但无法生成向量嵌入，无法进行知识检索。请检查API密钥或网络连接。", "filename": file.filename}
 
     # 存入 ChromaDB
     chroma_collection.add(
@@ -279,7 +324,7 @@ async def chat(req: ChatRequest):
             if query_emb:
                 results = chroma_collection.query(
                     query_embeddings=[query_emb],
-                    n_results=3
+                    n_results=MAX_RELEVANT_CHUNKS
                 )
                 if results and results['documents']:
                     relevant_chunks = results['documents'][0]
@@ -289,17 +334,13 @@ async def chat(req: ChatRequest):
     # 3. 构建上下文
     context_str = ""
     if relevant_chunks:
-        context_str = "以下是相关的背景知识，请依据这些知识回答问题：\n\n"
-        for i, chunk in enumerate(relevant_chunks):
-            context_str += f"[资料 {i+1}]: {chunk}\n"
-        context_str += "\n---\n"
+        context_str = "\n".join([f"[知识片段 {i+1}]\n{chunk}\n" for i, chunk in enumerate(relevant_chunks)])
+        print(f"[INFO] 找到 {len(relevant_chunks)} 个相关知识片段")
+    else:
+        print("[INFO] 未找到相关知识")
 
-    system_prompt = "你是一个乐于助人的 AI 助手。"
-    if context_str:
-        system_prompt += f"\n\n{context_str}\n如果背景知识与问题无关，你可以使用通用知识回答，但请优先参考背景资料。"
-
-    # 4. 获取历史对话 (最近 10 条)
-    c.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT 10",
+    # 4. 获取历史对话
+    c.execute(f"SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT {MAX_HISTORY_MESSAGES}",
               (req.sessionId,))
     history_rows = c.fetchall()
     history = [{"role": r["role"], "content": r["content"]} for r in reversed(history_rows)]
@@ -307,237 +348,125 @@ async def chat(req: ChatRequest):
     conn.close()
 
     # 5. 组装 Payload - 支持多模态
-    model_name = "qwen-turbo"
+    model_name = MODEL_NAME
     payload_messages = [
         {"role": "system", "content": system_prompt},
         *history,
+        {"role": "user", "content": req.message}
     ]
 
-    # 预处理图片数据：直接使用原始 data URL（不提取base64）
-    processed_images = []
-    if req.images and len(req.images) > 0:
-        for img_url in req.images:
-            # 直接保留原始 data URL 格式
-            processed_images.append(img_url)
-
-    # 如果有图片，使用 Qwen-VL 模型
-    if processed_images and len(processed_images) > 0:
-        model_name = "qwen-vl-plus"
-        # 构建多模态消息 - 使用 image_url 对象格式
-        image_contents = []
-        print(f"收到图片数量: {len(processed_images)}")
-        for i, img_url in enumerate(processed_images):
-            print(f"图片 {i+1}: {img_url[:50]}...")
-            # 使用 image_url 对象格式
-            image_contents.append({"image": img_url})
-        # 添加文字描述
-        image_contents.append({"text": req.message or "请描述这张图片"})
-        print(f"最终 content: {image_contents}")
-        payload_messages.append({"role": "user", "content": image_contents})
-    else:
-        payload_messages.append({"role": "user", "content": req.message})
-
-    # 6. 定义流式生成器
+    # 6. 流式调用模型
     async def generate_stream():
         full_reply = ""
         try:
-            # 如果有图片，使用 HTTP API 调用 Qwen-VL
-            if processed_images and len(processed_images) > 0:
-                # 直接使用已经构建好的 payload_messages（包含完整 data URL）
-                mm_messages = payload_messages.copy()
+            # 流式调用模型
+            response = Generation.call(
+                model=model_name,
+                messages=payload_messages,
+                result_format="message",
+                stream=True
+            )
 
-                print(f"多模态消息图片数量: {len(processed_images)}, 第一张长度: {len(processed_images[0]) if processed_images else 0}")
-
-                # 打印发送给 API 的完整请求体
-                api_request = {
-                    "model": model_name,
-                    "input": {"messages": mm_messages},
-                    "parameters": {"result_format": "message"}
-                }
-                print(f"API Request: {json.dumps(api_request, ensure_ascii=False)[:500]}...")
-
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream(
-                        "POST",
-                        "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-                        headers={
-                            "Authorization": f"Bearer {API_KEY}",
-                            "Content-Type": "application/json",
-                            "X-DashScope-SSE": "enable"
-                        },
-                        json={
-                            "model": model_name,
-                            "input": {"messages": mm_messages},
-                            "parameters": {"result_format": "message"}
-                        }
-                    ) as response:
-                        print(f"API response status: {response.status_code}")
-                        if response.status_code != 200:
-                            error_text = await response.aread()
-                            print(f"API error: {response.status_code} - {error_text}")
-                            yield f"data: {json.dumps({'error': f'API Error: {response.status_code}', 'details': error_text.decode()})}\n\n"
-                            return
-
-                        async for line in response.aiter_lines():
-                            if line.startswith("data:"):
-                                content_str = line[5:].strip()
-                                if content_str and content_str != "[DONE]":
-                                    try:
-                                        data = json.loads(content_str)
-                                        print(f"VL Response: {data}")
-
-                                        # 修复：正确解析多模态响应
-                                        output = data.get("output", {})
-                                        choices = output.get("choices", [])
-                                        if choices:
-                                            choice = choices[0]
-                                            message = choice.get("message", {})
-                                            content_obj = message.get("content", [])
-
-                                            # 多模态返回通常是列表，包含 image 和 text
-                                            text_content = ""
-                                            for item in content_obj:
-                                                if item.get("text"):
-                                                    text_content += item.get("text", "")
-
-                                            if text_content:
-                                                # 直接使用完整内容作为最新状态
-                                                new_content = text_content[len(full_reply):]
-                                                full_reply = text_content
-                                                if new_content:
-                                                    yield f"data: {json.dumps({'content': new_content})}\n\n"
-                                    except json.JSONDecodeError:
-                                        print(f"JSON decode error on line: {line}")
-                                        continue
-                                    except Exception as e:
-                                        print(f"Error processing response line: {e}")
-                                        continue
-                            elif line == "[DONE]":
-                                break
-            else:
-                # 文本模式使用 HTTP 调用
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream(
-                        "POST",
-                        "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-                        headers={
-                            "Authorization": f"Bearer {API_KEY}",
-                            "Content-Type": "application/json",
-                            "X-DashScope-SSE": "enable"
-                        },
-                        json={
-                            "model": model_name,
-                            "input": {"messages": payload_messages},
-                            "parameters": {"result_format": "message"}
-                        }
-                    ) as response:
-                        if response.status_code != 200:
-                            error_text = await response.aread()
-                            yield f"data: {json.dumps({'error': f'API Error: {response.status_code}'})}\n\n"
-                            return
-
-                        async for line in response.aiter_lines():
-                            if line.startswith("data:"):
-                                content_str = line[5:].strip()
-                                if content_str and content_str != "[DONE]":
-                                    try:
-                                        data = json.loads(content_str)
-                                        content = data.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content", "")
-                                        print(f"Text Response: {content}")
-                                        if content:
-                                            # 累加发送内容
-                                            new_content = content[len(full_reply):]
-                                            full_reply = content  # 直接使用完整内容作为最新状态
-                                            print(f"Full reply: {full_reply}, New content: {new_content}")
-                                            if new_content:
-                                                yield f"data: {json.dumps({'content': new_content})}\n\n"
-                                    except json.JSONDecodeError:
-                                        continue
-
-            # 7. 流结束后，保存 AI 回复到数据库
-            save_conn = await get_db_connection()
-            save_c = save_conn.cursor()
-            save_c.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
-                           (req.sessionId, "assistant", full_reply))
-            save_conn.commit()
-            save_conn.close()
-
-            yield "data: [DONE]\n\n"
-
+            async for line in response.aiter_lines():
+                if line.startswith("data:"):
+                    content_str = line[5:].strip()
+                    if content_str and content_str != "[DONE]":
+                        try:
+                            data = json.loads(content_str)
+                            content = data.get("output", {}).get("choices", [{}])[0].get("message", {}).get("content", "")
+                            print(f"Text Response: {content}")
+                            if content:
+                                # 累加发送内容
+                                new_content = content[len(full_reply):]
+                                full_reply = content
+                                if new_content:
+                                    yield f"data: {json.dumps({'content': new_content})}\n\n"
+                        except json.JSONDecodeError:
+                            print(f"JSON decode error on line: {line}")
+                            continue
+                        except Exception as e:
+                            print(f"Error processing response line: {e}")
+                            continue
+                elif line == "[DONE]":
+                    break
         except Exception as e:
             print(f"Stream Error: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            # 保存 AI 回复到数据库
+            if full_reply:
+                try:
+                    conn = await get_db_connection()
+                    c = conn.cursor()
+                    c.execute("INSERT INTO messages (session_id, role, content, images) VALUES (?, ?, ?, ?)",
+                              (req.sessionId, "assistant", full_reply, '[]'))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"Error saving assistant message: {e}")
 
+    # 7. 流式返回响应
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
-#--- 新增API：删除/修改某条特定消息（用于编辑功能）----
-# 策略：当用户编辑某条消息时，我们删除该消息之后的所有消息（包括它自己）
-# 然后插入新的用户消息，触发重新生成
-@app.delete("/api/message/{message_id}")
-async def delete_message(message_id: int):
-    # 这是一个简化策略：找到这条消息的 session，删除这条消息及其之后的所有消息
+
+# --- 新增 API: 删除会话 ---
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: int):
     conn = await get_db_connection()
     c = conn.cursor()
-   # 1. 找到这条消息的 session_id 和 created_at
-    c.execute("SELECT session_id, created_at FROM messages WHERE id = ?", (message_id,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="消息不存在")
-    session_id, created_at = row['session_id'], row['created_at']
-    # 2. 删除该时间点之后的所有消息 (包含这条)
-    c.execute("DELETE FROM messages WHERE session_id = ? AND created_at >= ?", (session_id, created_at))
+    # 先删除会话的所有消息
+    c.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+    # 再删除会话本身
+    c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
     conn.commit()
     conn.close()
-    return {"message": "消息已删除", "sessionId": session_id}
+    return {"message": "会话已删除"}
 
-# 删除单条消息
+# --- 新增 API: 删除单条消息 ---
 @app.delete("/api/msg/{message_id}")
 async def delete_single_message(message_id: int):
     conn = await get_db_connection()
     c = conn.cursor()
-    try:
-        # 获取要删除的消息信息
-        c.execute("SELECT session_id, role, created_at FROM messages WHERE id = ?", (message_id,))
-        row = c.fetchone()
-        if not row:
-            conn.close()
-            raise HTTPException(status_code=404, detail="消息不存在")
-        session_id, role, created_at = row
-        # 2. 找到对应的消息
-        if role == "user":
-            # 删除用户消息时，删除对应的 AI 回复
-            # 查找同一会话中，在该用户消息之后的第一条 assistant 消息
-            c.execute('''
-                SELECT id FROM messages
-                WHERE session_id = ? AND role = 'assistant' AND created_at > ?
-                ORDER BY created_at ASC LIMIT 1
-            ''', (session_id, created_at))
-            assistant_msg = c.fetchone()
-            if assistant_msg:
-                c.execute("DELETE FROM messages WHERE id = ?", (assistant_msg[0],))
-        else:  # role == "assistant"
-            # 删除 AI 回复时，删除对应的用户消息
-            # 查找同一会话中，在该回复之前的最后一条 user 消息
-            c.execute('''
-                SELECT id FROM messages
-                WHERE session_id = ? AND role = 'user' AND created_at < ?
-                ORDER BY created_at DESC LIMIT 1
-            ''', (session_id, created_at))
-            user_msg = c.fetchone()
-            if user_msg:
-                c.execute("DELETE FROM messages WHERE id = ?", (user_msg[0],))
 
-        # 3. 删除原始消息
-        c.execute("DELETE FROM messages WHERE id = ?", (message_id,))
-        conn.commit()
+    # 获取要删除的消息信息
+    c.execute("SELECT session_id, role, created_at FROM messages WHERE id = ?", (message_id,))
+    message = c.fetchone()
+
+    if not message:
         conn.close()
-        return {"message": "消息已删除"}
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"删除消息失败: {str(e)}")
+        raise HTTPException(status_code=404, detail="消息不存在")
+
+    session_id = message["session_id"]
+    role = message["role"]
+    created_at = message["created_at"]
+
+    # 删除选中的消息
+    c.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+
+    # 根据角色删除相关的消息对
+    if role == "user":
+        # 如果删除的是用户消息，查找并删除后续的AI回复
+        c.execute("""
+            DELETE FROM messages
+            WHERE session_id = ? AND role = 'assistant' AND created_at > ?
+            ORDER BY created_at ASC LIMIT 1
+        """, (session_id, created_at))
+    elif role == "assistant":
+        # 如果删除的是AI回复，查找并删除之前的用户消息
+        c.execute("""
+            DELETE FROM messages
+            WHERE session_id = ? AND role = 'user' AND created_at < ?
+            ORDER BY created_at DESC LIMIT 1
+        """, (session_id, created_at))
+
+    conn.commit()
+    conn.close()
+    return {"message": "消息及相关消息已删除"}
+
+# --- 系统提示词 ---
+system_prompt = "你是一个智能助手，基于用户提供的知识和对话历史进行回答。请保持回答友好、准确，并且只基于提供的信息进行回答。"
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    print(f"🚀 启动服务器: http://0.0.0.0:{port}")
+    port = int(os.getenv("PORT", 8000))  # 修改端口为 8000
+    print(f"[SERVER] 启动服务器: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
