@@ -122,12 +122,60 @@ class ChatRequest(BaseModel):
 class SessionCreate(BaseModel):
     title: Optional[str] = "新对话"
 
+# --- 数据库连接池 ---
+import threading
+from queue import Queue
+
+class SQLiteConnectionPool:
+    def __init__(self, db_path, max_connections=5):
+        self.db_path = db_path
+        self.max_connections = max_connections
+        self.pool = Queue(maxsize=max_connections)
+        self.lock = threading.Lock()
+
+        # 初始化连接池
+        for _ in range(max_connections):
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            self.pool.put(conn)
+
+    def get_connection(self):
+        """从连接池获取连接"""
+        return self.pool.get()
+
+    def return_connection(self, conn):
+        """将连接归还到连接池"""
+        if conn:
+            self.pool.put(conn)
+
+    def close_all(self):
+        """关闭所有连接"""
+        while not self.pool.empty():
+            try:
+                conn = self.pool.get_nowait()
+                conn.close()
+            except:
+                pass
+
+# 全局连接池实例
+db_pool = None
+
+def init_db_pool(db_path, max_connections=5):
+    """初始化数据库连接池"""
+    global db_pool
+    db_pool = SQLiteConnectionPool(db_path, max_connections)
+
 # --- 辅助函数 ---
 async def get_db_connection():
-    """获取数据库连接"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row # 可以用 row["column"] 访问
-    return conn
+    """从连接池获取数据库连接"""
+    if not db_pool:
+        init_db_pool(DB_PATH)
+    return db_pool.get_connection()
+
+async def return_db_connection(conn):
+    """归还数据库连接到连接池"""
+    if db_pool and conn:
+        db_pool.return_connection(conn)
 
 def get_embedding(text: str):
     """获取文本向量，只使用阿里云的文本向量化模型"""
@@ -277,38 +325,44 @@ def chunk_text(text: str, chunk_size: int = None, overlap: int = None):
 @app.get("/api/sessions")
 async def list_sessions():
     conn = await get_db_connection()
-    c = conn.cursor()
-    # 按时间倒序排列，最新的在最前
-    c.execute("SELECT id, title, created_at FROM sessions ORDER BY created_at DESC")
-    rows = c.fetchall()
-    conn.close()
-    return [{"id": row["id"], "title": row["title"], "createdAt": row["created_at"]} for row in rows]
+    try:
+        c = conn.cursor()
+        # 按时间倒序排列，最新的在最前
+        c.execute("SELECT id, title, created_at FROM sessions ORDER BY created_at DESC")
+        rows = c.fetchall()
+        return [{"id": row["id"], "title": row["title"], "createdAt": row["created_at"]} for row in rows]
+    finally:
+        await return_db_connection(conn)
 
 # --- 新增 API: 创建新会话 ---
 @app.post("/api/session")
 async def create_session(session: SessionCreate):
     conn = await get_db_connection()
-    c = conn.cursor()
-    c.execute("INSERT INTO sessions (title) VALUES (?)", (session.title,))
-    session_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return {"id": session_id, "title": session.title}
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO sessions (title) VALUES (?)", (session.title,))
+        session_id = c.lastrowid
+        conn.commit()
+        return {"id": session_id, "title": session.title}
+    finally:
+        await return_db_connection(conn)
 
 # --- 新增 API: 获取会话历史 ---
 @app.get("/api/session/{session_id}")
 async def get_session_history(session_id: int):
     conn = await get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT role, content, images FROM messages WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
-    rows = c.fetchall()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT role, content, images FROM messages WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
+        rows = c.fetchall()
 
-    result = []
-    for row in rows:
-        imgList = json.loads(row["images"]) if row["images"] else []
-        result.append({"role": row["role"], "content": row["content"], "images": imgList})
-    return result
+        result = []
+        for row in rows:
+            imgList = json.loads(row["images"]) if row["images"] else []
+            result.append({"role": row["role"], "content": row["content"], "images": imgList})
+        return result
+    finally:
+        await return_db_connection(conn)
 
 # --- 辅助函数：文件处理 ---
 def process_pdf(file_content):
@@ -895,13 +949,15 @@ def build_context(relevant_chunks, chunk_sources, image_context):
 async def get_history_messages(session_id, max_history):
     """获取历史对话"""
     conn = await get_db_connection()
-    c = conn.cursor()
-    c.execute(f"SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT {max_history}",
-              (session_id,))
-    history_rows = c.fetchall()
-    history = [{"role": r["role"], "content": r["content"]} for r in reversed(history_rows)]
-    conn.close()
-    return history
+    try:
+        c = conn.cursor()
+        c.execute(f"SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at DESC LIMIT {max_history}",
+                  (session_id,))
+        history_rows = c.fetchall()
+        history = [{"role": r["role"], "content": r["content"]} for r in reversed(history_rows)]
+        return history
+    finally:
+        await return_db_connection(conn)
 
 # 辅助函数：构建消息
 def build_messages(system_prompt, history, message, images):
@@ -1002,13 +1058,14 @@ async def generate_streaming_response(model_config, payload_messages, session_id
         # 保存响应到数据库
         if full_response:
             try:
-                conn = sqlite3.connect(DB_PATH)
-                conn.row_factory = sqlite3.Row
-                c = conn.cursor()
-                c.execute("INSERT INTO messages (session_id, role, content, images) VALUES (?, ?, ?, ?)",
-                          (session_id, "assistant", full_response, json.dumps([])))
-                conn.commit()
-                conn.close()
+                conn = await get_db_connection()
+                try:
+                    c = conn.cursor()
+                    c.execute("INSERT INTO messages (session_id, role, content, images) VALUES (?, ?, ?, ?)",
+                              (session_id, "assistant", full_response, json.dumps([])))
+                    conn.commit()
+                finally:
+                    await return_db_connection(conn)
             except Exception as db_error:
                 pass
         # 结束响应
@@ -1026,7 +1083,7 @@ async def chat(req: ChatRequest):
                   (req.sessionId, "user", req.message, json.dumps(req.images or [])))
         conn.commit()
     finally:
-        conn.close()
+        await return_db_connection(conn)
 
     # 2. 处理图片内容
     image_context, is_valid = process_images(req.images)
@@ -1079,55 +1136,58 @@ async def chat(req: ChatRequest):
 @app.delete("/api/session/{session_id}")
 async def delete_session(session_id: int):
     conn = await get_db_connection()
-    c = conn.cursor()
-    # 先删除会话的所有消息
-    c.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-    # 再删除会话本身
-    c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-    conn.commit()
-    conn.close()
-    return {"message": "会话已删除"}
+    try:
+        c = conn.cursor()
+        # 先删除会话的所有消息
+        c.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        # 再删除会话本身
+        c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.commit()
+        return {"message": "会话已删除"}
+    finally:
+        await return_db_connection(conn)
 
 # --- 新增 API: 删除单条消息 ---
 @app.delete("/api/msg/{message_id}")
 async def delete_single_message(message_id: int):
     conn = await get_db_connection()
-    c = conn.cursor()
+    try:
+        c = conn.cursor()
 
-    # 获取要删除的消息信息
-    c.execute("SELECT session_id, role, created_at FROM messages WHERE id = ?", (message_id,))
-    message = c.fetchone()
+        # 获取要删除的消息信息
+        c.execute("SELECT session_id, role, created_at FROM messages WHERE id = ?", (message_id,))
+        message = c.fetchone()
 
-    if not message:
-        conn.close()
-        raise HTTPException(status_code=404, detail="消息不存在")
+        if not message:
+            raise HTTPException(status_code=404, detail="消息不存在")
 
-    session_id = message["session_id"]
-    role = message["role"]
-    created_at = message["created_at"]
+        session_id = message["session_id"]
+        role = message["role"]
+        created_at = message["created_at"]
 
-    # 删除选中的消息
-    c.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        # 删除选中的消息
+        c.execute("DELETE FROM messages WHERE id = ?", (message_id,))
 
-    # 根据角色删除相关的消息对
-    if role == "user":
-        # 如果删除的是用户消息，查找并删除后续的AI回复
-        c.execute("""
-            DELETE FROM messages
-            WHERE session_id = ? AND role = 'assistant' AND created_at > ?
-            ORDER BY created_at ASC LIMIT 1
-        """, (session_id, created_at))
-    elif role == "assistant":
-        # 如果删除的是AI回复，查找并删除之前的用户消息
-        c.execute("""
-            DELETE FROM messages
-            WHERE session_id = ? AND role = 'user' AND created_at < ?
-            ORDER BY created_at DESC LIMIT 1
-        """, (session_id, created_at))
+        # 根据角色删除相关的消息对
+        if role == "user":
+            # 如果删除的是用户消息，查找并删除后续的AI回复
+            c.execute("""
+                DELETE FROM messages
+                WHERE session_id = ? AND role = 'assistant' AND created_at > ?
+                ORDER BY created_at ASC LIMIT 1
+            """, (session_id, created_at))
+        elif role == "assistant":
+            # 如果删除的是AI回复，查找并删除之前的用户消息
+            c.execute("""
+                DELETE FROM messages
+                WHERE session_id = ? AND role = 'user' AND created_at < ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (session_id, created_at))
 
-    conn.commit()
-    conn.close()
-    return {"message": "消息及相关消息已删除"}
+        conn.commit()
+        return {"message": "消息及相关消息已删除"}
+    finally:
+        await return_db_connection(conn)
 
 # --- 系统提示词 ---
 system_prompt = "你是一个智能助手，基于用户提供的知识和对话历史进行回答。请保持回答友好、准确，并且只基于提供的信息进行回答。"
