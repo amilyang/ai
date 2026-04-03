@@ -1,25 +1,36 @@
 <script setup lang="ts">
 import type { UploadFile, UploadRawFile } from 'element-plus';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElProgress } from 'element-plus';
 import { ref } from 'vue';
 
 const fileList = ref<UploadFile[]>([]);
 const isUploading = ref(false);
 const uploadStatus = ref<'idle' | 'uploading' | 'success' | 'error'>('idle');
+const uploadProgress = ref(0);
 
 const beforeUpload = (file: UploadRawFile) => {
-  const isTxt = file.name.endsWith('.txt');
-  const isLt10M = file.size / 1024 / 1024 < 10;
+  const isSupported = file.name.endsWith('.txt') ||
+                     file.name.endsWith('.md') ||
+                     file.name.endsWith('.json') ||
+                     file.name.endsWith('.csv') ||
+                     file.name.endsWith('.pdf') ||
+                     file.name.endsWith('.docx') ||
+                     file.name.endsWith('.jpg') ||
+                     file.name.endsWith('.jpeg') ||
+                     file.name.endsWith('.png') ||
+                     file.name.endsWith('.gif');
+  const isLt50M = file.size / 1024 / 1024 < 50;
 
-  if (!isTxt) {
-    ElMessage.error('只能上传 .txt 文件');
+  if (!isSupported) {
+    ElMessage.error('支持的文件类型: .txt, .md, .json, .csv, .pdf, .docx, .jpg, .jpeg, .png, .gif');
     return false;
   }
-  if (!isLt10M) {
-    ElMessage.error('文件大小不能超过 10MB');
+  if (!isLt50M) {
+    ElMessage.error('文件大小不能超过 50MB');
     return false;
   }
   uploadStatus.value = 'idle';
+  uploadProgress.value = 0;
   fileList.value = [{ ...file, status: 'ready' } as UploadFile];
   return true;
 };
@@ -37,7 +48,8 @@ const uploadFile = async () => {
 
   isUploading.value = true;
   uploadStatus.value = 'uploading';
-  ElMessage.info('正在向量化...');
+  uploadProgress.value = 0;
+  ElMessage.info('正在处理文件...');
 
   const formData = new FormData();
   formData.append('file', file.raw);
@@ -45,14 +57,30 @@ const uploadFile = async () => {
   try {
     const response = await fetch('/api/upload', {
       method: 'POST',
-      body: formData
+      body: formData,
+      // 添加上传进度监听
+      /* 注意：fetch API 不直接支持上传进度，需要使用 XMLHttpRequest 或 axios 来实现 */
+      // 这里使用模拟进度，实际项目中可以使用 axios 来获取真实进度
     });
 
+    // 模拟上传进度
+    const progressInterval = setInterval(() => {
+      if (uploadProgress.value < 90) {
+        uploadProgress.value += 10;
+      }
+    }, 200);
+
     const result = await response.json();
+    clearInterval(progressInterval);
+    uploadProgress.value = 100;
 
     if (response.ok) {
       uploadStatus.value = 'success';
-      ElMessage.success('✅ 学习完成！现在可以问我关于这个文档的问题了。');
+      if (result.duplicate) {
+        ElMessage.success('✅ 文件已存在，无需重复上传！');
+      } else {
+        ElMessage.success(`✅ 上传成功！成功处理 ${result.processed_chunks || 0} 个知识片段。`);
+      }
     } else {
       uploadStatus.value = 'error';
       ElMessage.error('❌ 上传失败: ' + (result.detail || '未知错误'));
@@ -69,18 +97,12 @@ const uploadFile = async () => {
 const handleRemove = () => {
   fileList.value = [];
   uploadStatus.value = 'idle';
+  uploadProgress.value = 0;
 };
 </script>
 
 <template>
   <el-card class="upload-card">
-    <template #header>
-      <div class="card-header">
-        <span class="title">上传文档</span>
-        <el-tag type="info">仅支持 .txt, .md, .pdf 格式</el-tag>
-      </div>
-    </template>
-
     <el-upload
       ref="uploadRef"
       v-model:file-list="fileList"
@@ -91,7 +113,7 @@ const handleRemove = () => {
       :before-upload="beforeUpload"
       :on-exceed="handleExceed"
       :on-remove="handleRemove"
-      accept=".txt,.md,.pdf"
+      accept=".txt,.md,.json,.csv,.pdf,.docx,.jpg,.jpeg,.png,.gif"
     >
       <el-button type="primary">
         <el-icon class="el-icon--left"><Upload /></el-icon>
@@ -99,21 +121,24 @@ const handleRemove = () => {
       </el-button>
       <template #tip>
         <div class="el-upload__tip">
-          文件大小不超过 10MB
+          支持的文件类型: .txt, .md, .json, .csv, .pdf, .docx, .jpg, .jpeg, .png, .gif<br>
+          文件大小不超过 50MB
         </div>
       </template>
     </el-upload>
 
     <div class="upload-status" v-if="uploadStatus !== 'idle'">
       <el-alert
-        :title="uploadStatus === 'uploading' ? '正在向量化...' :
-                uploadStatus === 'success' ? '学习完成！现在可以问我关于这个文档的问题了。' :
+        :title="uploadStatus === 'uploading' ? '正在处理文件...' :
+                uploadStatus === 'success' ? '上传成功！' :
                 '上传失败'"
         :type="uploadStatus === 'uploading' ? 'info' :
                uploadStatus === 'success' ? 'success' : 'error'"
         :closable="false"
         show-icon
       />
+
+      <el-progress v-if="uploadStatus === 'uploading'" :percentage="uploadProgress" :format="() => '处理中...'" />
     </div>
 
     <div class="upload-actions">
@@ -154,6 +179,7 @@ const handleRemove = () => {
 .el-upload__tip {
   margin-top: 10px;
   color: #999;
+  line-height: 1.5;
 }
 
 .upload-status {
@@ -162,5 +188,9 @@ const handleRemove = () => {
 
 .upload-actions {
   margin-top: 20px;
+}
+
+.el-progress {
+  margin-top: 10px;
 }
 </style>

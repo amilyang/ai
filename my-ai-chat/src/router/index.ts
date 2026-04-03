@@ -7,8 +7,8 @@
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
 import { createRouter, createWebHistory } from 'vue-router'
-import ChatMain from '../ChatMain.vue'
-import uploadFile from '../uploadFile.vue'
+import ChatMain from '../views/ChatMain.vue'
+import fileManager from '../views/fileManager.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -23,9 +23,9 @@ const router = createRouter({
       component: ChatMain
     },
     {
-      path: '/upload',
-      name: 'upload',
-      component: uploadFile
+      path: '/files',
+      name: 'files',
+      component: fileManager
     }
   ]
 })

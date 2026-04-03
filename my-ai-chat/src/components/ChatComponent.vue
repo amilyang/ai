@@ -2,7 +2,7 @@
  * @Author: e0042176 e0042176@ceic.com
  * @Date: 2026-03-04 16:31:49
  * @LastEditors: e0042176 e0042176@ceic.com
- * @LastEditTime: 2026-03-18 14:19:04
+ * @LastEditTime: 2026-03-31 11:21:56
  * @FilePath: \ai\my-ai-chat\src\components\ChatComponent.vue
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 -->
@@ -141,9 +141,6 @@
 
             <!-- 右侧发送按钮 -->
             <div class="flex gap-2 items-center">
-              <button class="text-gray-500 hover:text-gray-700 transition-colors">
-                <el-icon class="w-5 h-5"><VideoPlay /></el-icon>
-              </button>
               <button
                 v-if="!isThinking"
                 @click="sendMessage"
@@ -162,7 +159,6 @@
               </button>
             </div>
           </div>
-
         </div>
       </div>
       <div class="text-center text-xs text-gray-400 mt-2">
@@ -193,7 +189,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits(['updateTitle', 'sessionCreated', 'refreshSessions']);
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = import.meta.env.VITE_API_BASE;
 const messages = ref<Message[]>([]);
 const inputText = ref('');
 const isThinking = ref(false);
@@ -219,7 +215,7 @@ const loadHistory = async (sessionId: number) => {
   editingId.value = null;
   editText.value = '';
   try {
-    const res = await fetch(`${API_BASE}/history/${sessionId}`);
+    const res = await fetch(`${API_BASE}/session/${sessionId}`);
     if (!res.ok) {
       console.error('加载历史失败:', res.status, await res.text());
       return;
@@ -278,7 +274,8 @@ const sendMessage = async (event?: MouseEvent | KeyboardEvent | string | null) =
   if (!textToSend.trim()) return;
 
   // 如果没有 sessionId，先创建会话
-  if (!props.sessionId) {
+  let currentSessionId = props.sessionId;
+  if (!currentSessionId) {
     let title = textToSend.slice(0, 20);
     if (title.length >= 20) title += '...';
     try {
@@ -288,16 +285,16 @@ const sendMessage = async (event?: MouseEvent | KeyboardEvent | string | null) =
         body: JSON.stringify({ title })
       });
       const data = await res.json();
-      emit('sessionCreated', data.sessionId);
+      currentSessionId = data.id; // 直接使用返回的sessionId
+      emit('sessionCreated', currentSessionId);
       emit('refreshSessions');
-      await new Promise(resolve => setTimeout(resolve, 500));
     } catch (e) {
       console.error('创建会话失败', e);
       return;
     }
   }
 
-  if (!props.sessionId) {
+  if (!currentSessionId) {
     console.error('sessionId 未更新，无法发送消息');
     return;
   }
@@ -340,7 +337,7 @@ const sendMessage = async (event?: MouseEvent | KeyboardEvent | string | null) =
       message: string;
       images?: string[];
     }
-    const requestBody: ChatRequestBody = { sessionId: props.sessionId as number, message: textToSend };
+    const requestBody: ChatRequestBody = { sessionId: currentSessionId, message: textToSend };
     if (imagesToSend.length > 0) {
       requestBody.images = imagesToSend;
     }

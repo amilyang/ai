@@ -76,9 +76,9 @@
 <script setup lang="ts">
 import ChatComponent from '@/components/ChatComponent.vue';
 import { onMounted, ref, watch } from 'vue';
-import type { Session } from './types';
+import type { Session } from '../types';
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = import.meta.env.VITE_API_BASE;
 const isSidebarOpen = ref(true);
 const sessions = ref<Session[]>([]);
 const currentSessionId = ref<number | null>(Number(localStorage.getItem('sessionId')) || null);
