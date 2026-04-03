@@ -122,6 +122,70 @@ class ChatRequest(BaseModel):
 class SessionCreate(BaseModel):
     title: Optional[str] = "新对话"
 
+# --- 错误处理模块 ---
+class AppError(Exception):
+    """应用自定义异常基类"""
+    def __init__(self, code: str, message: str, status_code: int = 400):
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        super().__init__(self.message)
+
+class ValidationError(AppError):
+    """验证错误"""
+    def __init__(self, message: str):
+        super().__init__("VALIDATION_ERROR", message, 400)
+
+class DatabaseError(AppError):
+    """数据库错误"""
+    def __init__(self, message: str):
+        super().__init__("DATABASE_ERROR", message, 500)
+
+class ModelError(AppError):
+    """模型错误"""
+    def __init__(self, message: str):
+        super().__init__("MODEL_ERROR", message, 500)
+
+class FileError(AppError):
+    """文件错误"""
+    def __init__(self, message: str):
+        super().__init__("FILE_ERROR", message, 400)
+
+class NotFoundError(AppError):
+    """资源不存在错误"""
+    def __init__(self, message: str):
+        super().__init__("NOT_FOUND", message, 404)
+
+# 统一错误响应格式
+def error_response(code: str, message: str, status_code: int = 400):
+    """生成统一格式的错误响应"""
+    return {"error": {"code": code, "message": message}}, status_code
+
+# 流式错误响应
+def streaming_error_response(code: str, message: str):
+    """生成流式错误响应"""
+    async def error_streamer():
+        yield f"data: {json.dumps({'error': {'code': code, 'message': message}}, ensure_ascii=False)}\n\n"
+        yield f"data: [DONE]\n\n"
+    return StreamingResponse(error_streamer(), media_type="text/event-stream")
+
+# --- 全局异常处理 ---
+@app.exception_handler(AppError)
+async def app_error_handler(request, exc: AppError):
+    """处理应用自定义异常"""
+    return error_response(exc.code, exc.message, exc.status_code)
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(request, exc: HTTPException):
+    """处理 HTTP 异常"""
+    return error_response("HTTP_ERROR", exc.detail, exc.status_code)
+
+@app.exception_handler(Exception)
+async def general_error_handler(request, exc: Exception):
+    """处理通用异常"""
+    print(f"[ERROR] 未捕获的异常: {exc}")
+    return error_response("INTERNAL_ERROR", "服务器内部错误，请稍后重试", 500)
+
 # --- 数据库连接池 ---
 import threading
 from queue import Queue
@@ -996,13 +1060,13 @@ async def generate_streaming_response(model_config, payload_messages, session_id
     try:
         # 检查 API_KEY
         if not API_KEY:
-            yield f"data: {json.dumps({'error': 'API_KEY 未设置，无法调用模型'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'error': {'code': 'API_KEY_MISSING', 'message': 'API_KEY 未设置，无法调用模型'}}, ensure_ascii=False)}\n\n"
             yield f"data: [DONE]\n\n"
             return
 
         # 检查模型配置
         if not model_config or "endpoint" not in model_config:
-            yield f"data: {json.dumps({'error': '模型配置不正确，缺少endpoint'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'error': {'code': 'MODEL_CONFIG_ERROR', 'message': '模型配置不正确，缺少endpoint'}}, ensure_ascii=False)}\n\n"
             yield f"data: [DONE]\n\n"
             return
 
@@ -1021,7 +1085,7 @@ async def generate_streaming_response(model_config, payload_messages, session_id
                 ) as response:
                     # 检查响应状态
                     if response.status_code != 200:
-                        yield f"data: {json.dumps({'error': f'模型API返回错误状态码: {response.status_code}'}, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'error': {'code': 'MODEL_API_ERROR', 'message': f'模型API返回错误状态码: {response.status_code}'}}, ensure_ascii=False)}\n\n"
                         yield f"data: [DONE]\n\n"
                         return
 
@@ -1036,7 +1100,7 @@ async def generate_streaming_response(model_config, payload_messages, session_id
                                     # 检查是否是错误响应
                                     if 'code' in data and 'message' in data:
                                         error_message = f"模型API错误: {data['message']}"
-                                        yield f"data: {json.dumps({'error': error_message}, ensure_ascii=False)}\n\n"
+                                        yield f"data: {json.dumps({'error': {'code': 'MODEL_API_ERROR', 'message': error_message}}, ensure_ascii=False)}\n\n"
                                     else:
                                         content = model_config["response_parser"](data)
                                         if content:
@@ -1047,13 +1111,13 @@ async def generate_streaming_response(model_config, payload_messages, session_id
                                                 yield f"data: {json.dumps({'content': new_content}, ensure_ascii=False)}\n\n"
                                                 previous_content = content
                                 except Exception as e:
-                                    yield f"data: {json.dumps({'error': f'解析模型响应失败: {str(e)}'}, ensure_ascii=False)}\n\n"
+                                    yield f"data: {json.dumps({'error': {'code': 'PARSING_ERROR', 'message': f'解析模型响应失败: {str(e)}'}}, ensure_ascii=False)}\n\n"
                         elif line == "[DONE]":
                             break
         except Exception as e:
-            yield f"data: {json.dumps({'error': f'模型调用失败: {str(e)}'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'error': {'code': 'MODEL_ERROR', 'message': f'模型调用失败: {str(e)}'}}, ensure_ascii=False)}\n\n"
     except Exception as e:
-        yield f"data: {json.dumps({'error': f'函数执行失败: {str(e)}'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'error': {'code': 'INTERNAL_ERROR', 'message': f'函数执行失败: {str(e)}'}}, ensure_ascii=False)}\n\n"
     finally:
         # 保存响应到数据库
         if full_response:
@@ -1067,69 +1131,91 @@ async def generate_streaming_response(model_config, payload_messages, session_id
                 finally:
                     await return_db_connection(conn)
             except Exception as db_error:
-                pass
+                print(f"[ERROR] 保存响应到数据库失败: {db_error}")
         # 结束响应
         yield f"data: [DONE]\n\n"
+
+# 辅助函数：保存用户消息到数据库
+async def save_user_message(session_id: int, message: str, images: list):
+    """保存用户消息到数据库"""
+    conn = await get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO messages (session_id, role, content, images) VALUES (?, ?, ?, ?)",
+                  (session_id, "user", message, json.dumps(images or [])))
+        conn.commit()
+    finally:
+        await return_db_connection(conn)
+
+# 辅助函数：处理图片并返回错误响应（如果需要）
+async def handle_images(images: list):
+    """处理图片内容并返回错误响应（如果需要）"""
+    image_context, is_valid = process_images(images)
+    if not is_valid:
+        return None, streaming_error_response("VALIDATION_ERROR", "图片格式无效，请上传有效的图片数据")
+    return image_context, None
+
+# 辅助函数：构建聊天上下文
+async def build_chat_context(session_id: int, message: str, image_context: list):
+    """构建聊天上下文"""
+    # 检索相关知识
+    relevant_chunks, chunk_sources = retrieve_relevant_knowledge(message)
+    # 构建上下文
+    context_str = build_context(relevant_chunks, chunk_sources, image_context)
+    # 获取历史对话
+    history = await get_history_messages(session_id, MAX_HISTORY_MESSAGES)
+    return context_str, history
+
+# 辅助函数：准备模型参数
+async def prepare_model_parameters(context_str: str, history: list, message: str, images: list):
+    """准备模型参数"""
+    # 组装消息
+    system_prompt = "你是一个乐于助人的 AI 助手。"
+    if context_str:
+        system_prompt += f"\n\n{context_str}\n如果背景知识与问题无关，你可以使用通用知识回答，但请优先参考背景资料。"
+
+    payload_messages, selected_model = build_messages(system_prompt, history, message, images)
+
+    # 获取模型配置
+    model_config = MODEL_CONFIGS.get(selected_model)
+    if not model_config:
+        # 模型配置不存在，使用默认模型
+        model_config = MODEL_CONFIGS["qwen-turbo"]
+
+    return model_config, payload_messages
+
+# 辅助函数：生成流式响应
+async def generate_chat_response(model_config, payload_messages, session_id: int):
+    """生成流式响应"""
+    try:
+        # 调用模型生成响应
+        streamer = generate_streaming_response(model_config, payload_messages, session_id)
+        response = StreamingResponse(streamer, media_type="text/event-stream")
+        return response
+    except Exception as e:
+        # 返回一个错误响应
+        return streaming_error_response("MODEL_ERROR", f"创建流式响应失败: {str(e)}")
 
 # --- 新增 API: 与 AI 交互 ---
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """处理聊天请求"""
     # 1. 保存用户消息到数据库
-    conn = await get_db_connection()
-    try:
-        c = conn.cursor()
-        c.execute("INSERT INTO messages (session_id, role, content, images) VALUES (?, ?, ?, ?)",
-                  (req.sessionId, "user", req.message, json.dumps(req.images or [])))
-        conn.commit()
-    finally:
-        await return_db_connection(conn)
+    await save_user_message(req.sessionId, req.message, req.images)
 
     # 2. 处理图片内容
-    image_context, is_valid = process_images(req.images)
+    image_context, error_response = await handle_images(req.images)
+    if error_response:
+        return error_response
 
-    # 检查图片是否符合要求
-    if not is_valid:
-        # 图片不符合要求，返回错误响应
-        async def error_streamer():
-            yield f"data: {json.dumps({'error': '图片格式无效，请上传有效的图片数据'}, ensure_ascii=False)}\n\n"
-            yield f"data: [DONE]\n\n"
-        return StreamingResponse(error_streamer(), media_type="text/event-stream")
+    # 3. 构建聊天上下文
+    context_str, history = await build_chat_context(req.sessionId, req.message, image_context)
 
-    # 3. 检索相关知识
-    relevant_chunks, chunk_sources = retrieve_relevant_knowledge(req.message)
+    # 4. 准备模型参数
+    model_config, payload_messages = await prepare_model_parameters(context_str, history, req.message, req.images)
 
-    # 4. 构建上下文
-    context_str = build_context(relevant_chunks, chunk_sources, image_context)
-
-    # 5. 获取历史对话
-    history = await get_history_messages(req.sessionId, MAX_HISTORY_MESSAGES)
-
-    # 6. 组装消息
-    system_prompt = "你是一个乐于助人的 AI 助手。"
-    if context_str:
-        system_prompt += f"\n\n{context_str}\n如果背景知识与问题无关，你可以使用通用知识回答，但请优先参考背景资料。"
-
-    payload_messages, selected_model = build_messages(system_prompt, history, req.message, req.images)
-
-    # 7. 获取模型配置
-    model_config = MODEL_CONFIGS.get(selected_model)
-
-    if not model_config:
-        # 模型配置不存在，使用默认模型
-        model_config = MODEL_CONFIGS["qwen-turbo"]
-
-    # 8. 流式调用模型并返回响应
-    try:
-        # 调用模型生成响应
-        streamer = generate_streaming_response(model_config, payload_messages, req.sessionId)
-        response = StreamingResponse(streamer, media_type="text/event-stream")
-        return response
-    except Exception as e:
-        # 返回一个错误响应
-        async def error_generator():
-            yield f"data: {json.dumps({'error': f'创建流式响应失败: {str(e)}'}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(error_generator(), media_type="text/event-stream")
+    # 5. 生成流式响应
+    return await generate_chat_response(model_config, payload_messages, req.sessionId)
 
 
 # --- 新增 API: 删除会话 ---
