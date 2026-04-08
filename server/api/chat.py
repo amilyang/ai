@@ -16,7 +16,7 @@ router = APIRouter()
 # 辅助函数：保存用户消息到数据库
 async def save_user_message(session_id: int, message: str, images: Optional[List[str]]):
     """保存用户消息到数据库
-    
+
     Args:
         session_id: 会话ID
         message: 用户消息内容
@@ -34,10 +34,10 @@ async def save_user_message(session_id: int, message: str, images: Optional[List
 # 辅助函数：处理图片并返回错误响应（如果需要）
 async def handle_images(images: Optional[List[str]]):
     """处理图片内容并返回错误响应（如果需要）
-    
+
     Args:
         images: 图片列表
-    
+
     Returns:
         tuple: (image_context, error_response)
     """
@@ -49,13 +49,13 @@ async def handle_images(images: Optional[List[str]]):
 # 辅助函数：构建聊天上下文
 async def build_chat_context(session_id: int, message: str, image_context: list, chroma_collection):
     """构建聊天上下文
-    
+
     Args:
         session_id: 会话ID
         message: 用户消息内容
         image_context: 图片上下文
         chroma_collection: ChromaDB集合
-    
+
     Returns:
         tuple: (context_str, history)
     """
@@ -70,13 +70,13 @@ async def build_chat_context(session_id: int, message: str, image_context: list,
 # 辅助函数：准备模型参数
 async def prepare_model_parameters(context_str: str, history: list, message: str, images: Optional[List[str]]):
     """准备模型参数
-    
+
     Args:
         context_str: 上下文字符串
         history: 历史对话
         message: 用户消息内容
         images: 图片列表
-    
+
     Returns:
         tuple: (model_config, payload_messages)
     """
@@ -98,12 +98,12 @@ async def prepare_model_parameters(context_str: str, history: list, message: str
 # 辅助函数：生成流式响应
 async def generate_chat_response(model_config: dict, payload_messages: list, session_id: int):
     """生成流式响应
-    
+
     Args:
         model_config: 模型配置
         payload_messages: 消息负载
         session_id: 会话ID
-    
+
     Returns:
         StreamingResponse: 流式响应
     """
@@ -119,11 +119,11 @@ async def generate_chat_response(model_config: dict, payload_messages: list, ses
 # 辅助函数：获取历史对话
 async def get_history_messages(session_id: int, limit: int = 10):
     """从数据库获取历史对话
-    
+
     Args:
         session_id: 会话ID
         limit: 限制数量
-    
+
     Returns:
         list: 历史对话列表
     """
@@ -165,11 +165,11 @@ from dependencies import get_chroma_collection
 @router.post("/chat")
 async def chat(req: ChatRequest, chroma_collection=Depends(get_chroma_collection)):
     """处理聊天请求
-    
+
     Args:
         req: 聊天请求
         chroma_collection: ChromaDB集合
-    
+
     Returns:
         StreamingResponse: 流式响应
     """
@@ -189,153 +189,3 @@ async def chat(req: ChatRequest, chroma_collection=Depends(get_chroma_collection
 
     # 5. 生成流式响应
     return await generate_chat_response(model_config, payload_messages, req.sessionId)
-
-# 获取会话历史
-@router.get("/sessions/{session_id}/messages")
-async def get_session_history(session_id: int):
-    """获取会话历史
-    
-    Args:
-        session_id: 会话ID
-    
-    Returns:
-        list: 会话历史
-    """
-    conn = await get_db_connection()
-    try:
-        c = conn.cursor()
-        c.execute(
-            "SELECT id, role, content, images, created_at FROM messages WHERE session_id = ? ORDER BY created_at",
-            (session_id,)
-        )
-        messages = c.fetchall()
-        result = []
-        for msg in messages:
-            msg_id, role, content, images_json, created_at = msg
-            result.append({
-                "id": msg_id,
-                "role": role,
-                "content": content,
-                "images": json.loads(images_json) if images_json else [],
-                "created_at": created_at
-            })
-        return result
-    finally:
-        await return_db_connection(conn)
-
-# 列出所有会话
-@router.get("/sessions")
-async def list_sessions():
-    """列出所有会话
-    
-    Returns:
-        list: 会话列表
-    """
-    conn = await get_db_connection()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT id, title, created_at FROM sessions ORDER BY created_at DESC")
-        sessions = c.fetchall()
-        result = []
-        for session in sessions:
-            session_id, title, created_at = session
-            # 获取会话的第一条消息作为预览
-            c.execute(
-                "SELECT content FROM messages WHERE session_id = ? ORDER BY created_at LIMIT 1",
-                (session_id,)
-            )
-            first_message = c.fetchone()
-            preview = first_message[0] if first_message else ""
-            result.append({
-                "id": session_id,
-                "title": title,
-                "created_at": created_at,
-                "preview": preview[:50] + "..." if len(preview) > 50 else preview
-            })
-        return result
-    finally:
-        await return_db_connection(conn)
-
-# 创建新会话
-@router.post("/sessions")
-async def create_session(req: SessionCreate):
-    """创建新会话
-    
-    Args:
-        req: 会话创建请求
-    
-    Returns:
-        dict: 会话信息
-    """
-    conn = await get_db_connection()
-    try:
-        c = conn.cursor()
-        c.execute("INSERT INTO sessions (title) VALUES (?)", (req.title,))
-        session_id = c.lastrowid
-        conn.commit()
-        return {
-            "id": session_id,
-            "title": req.title,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
-    finally:
-        await return_db_connection(conn)
-
-# 删除会话
-@router.delete("/sessions/{session_id}")
-async def delete_session(session_id: int):
-    """删除会话
-    
-    Args:
-        session_id: 会话ID
-    
-    Returns:
-        dict: 操作结果
-    """
-    conn = await get_db_connection()
-    try:
-        c = conn.cursor()
-        # 先删除会话的所有消息
-        c.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        # 再删除会话
-        c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-        conn.commit()
-        if c.rowcount > 0:
-            return {"message": "会话删除成功"}
-        else:
-            raise HTTPException(status_code=404, detail="会话不存在")
-    finally:
-        await return_db_connection(conn)
-
-# 删除单条消息
-@router.delete("/msg/{message_id}")
-async def delete_single_message(message_id: int):
-    """删除单条消息
-    
-    Args:
-        message_id: 消息ID
-    
-    Returns:
-        dict: 操作结果
-    """
-    conn = await get_db_connection()
-    try:
-        c = conn.cursor()
-
-        # 获取要删除的消息信息
-        c.execute("SELECT session_id, role, created_at FROM messages WHERE id = ?", (message_id,))
-        message = c.fetchone()
-
-        if not message:
-            raise HTTPException(status_code=404, detail="消息不存在")
-
-        # 删除消息
-        c.execute("DELETE FROM messages WHERE id = ?", (message_id,))
-        conn.commit()
-
-        return {
-            "message": "消息删除成功",
-            "deleted_message_id": message_id
-        }
-    finally:
-        await return_db_connection(conn)

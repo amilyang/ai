@@ -2,7 +2,7 @@
  * @Author: e0042176 e0042176@ceic.com
  * @Date: 2026-03-04 16:31:49
  * @LastEditors: e0042176 e0042176@ceic.com
- * @LastEditTime: 2026-03-31 11:21:56
+ * @LastEditTime: 2026-04-08 10:08:52
  * @FilePath: \ai\my-ai-chat\src\components\ChatComponent.vue
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 -->
@@ -228,7 +228,7 @@ const loadHistory = async (sessionId: number) => {
       return;
     }
 
-    messages.value = data.map((msg: { role: string; content: string; images?: string[] }, idx: number) => {
+    messages.value = data.map((msg: { id: number; role: string; content: string; images?: string[] }) => {
       let content = msg.content;
       // 如果有图片，将图片 URL 转换为 Markdown 格式
       if (msg.images && msg.images.length > 0) {
@@ -238,7 +238,7 @@ const loadHistory = async (sessionId: number) => {
       return {
         role: msg.role as 'user' | 'assistant' | 'system',
         content,
-        id: `history-${sessionId}-${idx}-${Date.now()}`
+        id: msg.id // 使用后端返回的真实ID
       };
     });
 
@@ -445,20 +445,12 @@ const deleteMessage = async (msg: Message) => {
     deleteIndex2 = msgIndex - 1;
   }
 
-  // 构建要删除的消息ID列表
-  const idsToDelete: (string | number | undefined)[] = [messages.value[deleteIndex1]?.id];
-  if (deleteIndex2 >= 0 && deleteIndex2 < messages.value.length) {
-    idsToDelete.push(messages.value[deleteIndex2]?.id);
-  }
-
-  // 调用后端删除
-  for (const id of idsToDelete) {
-    if (id && typeof id === 'number') {  // 只删除数字ID的消息（数据库中存在的）
-      try {
-        await fetch(`${API_BASE}/msg/${id}`, { method: 'DELETE' });
-      } catch (e) {
-        console.error('删除消息失败', e);
-      }
+  // 调用后端删除消息对
+  if (msg.id && typeof msg.id === 'number') {  // 只删除数字ID的消息（数据库中存在的）
+    try {
+      await fetch(`${API_BASE}/msg/${msg.id}`, { method: 'DELETE' });
+    } catch (e) {
+      console.error('删除消息失败', e);
     }
   }
 
